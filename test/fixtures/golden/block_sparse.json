@@ -1,0 +1,34 @@
+{
+  "cpp_invocation": "cd <scratch with param.sdpa> && sdpa_gmp block_sparse.dat-s block_sparse.result -pt 0",
+  "cpp_iterations": 38,
+  "cpp_obj_dual_full": "164.999999999999999999999999999999999999998402466737363424927732445236787000001",
+  "cpp_obj_dual_summary16": "165.0",
+  "cpp_obj_primal_full": "165.0000000000000000000000000001553506303907999999999999999999999999999999999999",
+  "cpp_obj_primal_summary16": "165.0",
+  "cpp_phase": "pdOPT",
+  "fixture": "block_sparse.dat-s",
+  "julia_bigfloat": 
+  {
+    "iterations": 38,
+    "obj_dual": "165.0000000000000000000000000000000000000000000000000000000092399330845682232068",
+    "obj_primal": "165.0000000000000000000000000001553506303923975332626365750725046203499558144953",
+    "phase": "pdOPT",
+    "phase_match": true,
+    "precision_bits": 200,
+    "rtol_1e30_verdict_dual": true,
+    "rtol_1e30_verdict_primal": true,
+    "wall_seconds": 0.6
+  },
+  "julia_float64": 
+  {
+    "informational_only": false,
+    "iterations": 66,
+    "obj_dual": "165.0",
+    "obj_primal": "165.0",
+    "phase": "pdOPT",
+    "phase_match": true,
+    "rtol_1e10_verdict_dual": true,
+    "rtol_1e10_verdict_primal": true,
+    "wall_seconds": 0.0
+  }
+}

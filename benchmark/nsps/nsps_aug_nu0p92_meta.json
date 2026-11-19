@@ -1,0 +1,35 @@
+{
+  "nu": 0.92,
+  "problem": "NSPS dual SDP, P_g(A4|E) maximization, EBI+SIC-POVM, NPA level 2, fully DI (projective A4, dichotomic), A4-B3 augmentation (APVW 2016), synthetic Werner |psi^-> data at visibility nu",
+  "config": {
+    "level": "2",
+    "use_projective_a4": true,
+    "dichotomic": true,
+    "include_a4_b3": true,
+    "use_sicpovm_quadratic": false
+  },
+  "mosek": {
+    "P_g": 0.9179801066290203,
+    "H_min": 0.1234652052772917,
+    "status": "optimal",
+    "solve_time": 1.6479910435155034
+  },
+  "n_vars": 10259,
+  "M": 71,
+  "n_f": 35,
+  "n_gram": 2556,
+  "n_l": 14536,
+  "blockStruct": [
+    -14536,
+    71,
+    71,
+    71,
+    71
+  ],
+  "expected_value_note": "nu=0.92: no closed form; true value expected in [0.91790, 0.91799] (MOSEK accurate to ~2e-5 in P_g at nu <= 0.96, verified at nu=0.96: MOSEK 0.7214 vs SDPA-GMP 0.7213814986).",
+  "files": {
+    "dat_s": "benchmark/nsps/nsps_aug_nu0p92.dat-s",
+    "ini_s": "benchmark/nsps/nsps_aug_nu0p92.ini-s",
+    "param_sdpa": "benchmark/nsps/nsps_aug_nu0p92_param.sdpa"
+  }
+}

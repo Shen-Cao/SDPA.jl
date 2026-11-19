@@ -1,0 +1,9 @@
+{
+  "dFeasError": 2.3288474028067314e-62,
+  "objValPrimal": 0.5665172732159296,
+  "pFeasError": 9.034641372226502e-73,
+  "iteration": 53,
+  "phase": "pdOPT",
+  "mu": 2.3011472246564467e-33,
+  "objValDual": 0.5665172732159296
+}

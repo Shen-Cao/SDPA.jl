@@ -1,12 +1,6 @@
 # IDEs
 .vscode
 
-# AI tools
-*mcp-outputs
-.sisyphus
-.opencode
-.omo
-
 # Temporary directory
 tmp/
 

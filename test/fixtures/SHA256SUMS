@@ -1,0 +1,16 @@
+c570446e0921ab5d46793577c56faec1d53f46c4f6a12552b79f69efbc3196ce  example1.dat-s
+1a410e81ffef8fa912c436d342493d577d36eb8f54f4c7d627143f13aeb0e7ae  example1.dat
+2e87189c77823fafa2755f4fd6d0a2dd6476f06297a2d0d9a017b95ade3943bd  arch0.dat-s
+a18fdbeb0e1af50f2dda325fa8571f5d7ddf382bd9226a7469b23a1c1a00b43e  control5.dat-s
+94e41f6c1c89ed5c51006b8938cdcd39947519e9251512d929d0cf29b964c036  theta5.dat-s
+caa2f86da900eb25cf10a91d2cd894f89d7070a47ba6feb785ea7c2f0f2e5799  param.sdpa
+# NSPS benchmark fixtures (incl. the former nsps_werner_L2_aug.dat-s, now
+# benchmark/nsps/nsps_aug_nu1p0.dat-s) live under benchmark/nsps/; verify
+# with `sha256sum -c SHA256SUMS` from that directory.
+fb0570d5ab2971ddc5bcbd716baec5d0918d440c29d14887aad88760ade9587f  block_sparse.dat-s
+bd03e00489a128a053502000edd26bc7d1c4a496845e5f11bb41f845206dd2e3  cycle4_nonchordal.dat-s
+b0bf43047d6c5d7eb910f7c1cc1a2f844ced955cc4bfbcad80de1def753c300b  f4_mixed_dense_sparse.dat-s
+38fea98bfd25740ec1d3070248c97690f778cb847a865254f1a1dfeb43de1505  lp_first_mixed.dat-s
+7f3571432412d1ea1ac8dead45e3aca37986b2ada6ac876bf6c9923b98247327  minimal_sdp_lp.dat-s
+887b20c97647c04759d72e32505d65079c3667f3f42791f2ba4498daf9e4a33b  sdp6_blocks.dat-s
+097466f941479cbd96cc1de794fe45f39ba7cbac6880a76b1be8d9ada342f669  sparse_lp_profile.dat-s

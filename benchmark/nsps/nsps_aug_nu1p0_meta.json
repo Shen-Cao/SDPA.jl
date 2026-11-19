@@ -1,0 +1,35 @@
+{
+  "nu": 1.0,
+  "problem": "NSPS dual SDP, P_g(A4|E) maximization, EBI+SIC-POVM, NPA level 2, fully DI (projective A4, dichotomic), A4-B3 augmentation (APVW 2016), synthetic Werner |psi^-> data at visibility nu",
+  "config": {
+    "level": "2",
+    "use_projective_a4": true,
+    "dichotomic": true,
+    "include_a4_b3": true,
+    "use_sicpovm_quadratic": false
+  },
+  "mosek": {
+    "P_g": 0.25110008316187304,
+    "H_min": 1.99366558847149,
+    "status": "optimal",
+    "solve_time": 3.6093384129926562
+  },
+  "n_vars": 10259,
+  "M": 71,
+  "n_f": 35,
+  "n_gram": 2556,
+  "n_l": 14536,
+  "blockStruct": [
+    -14536,
+    71,
+    71,
+    71,
+    71
+  ],
+  "expected_value_note": "nu=1.0: P_g = 1/4 exactly (Andersson et al. PRA 97, 012314 (2018) 2-bit ceiling), H_min = 2.0 bits. Expected SDPA-GMP range: P_g in [0.24999999, 0.25000001]. 256-bit reference: P_g = 0.2500000074, H_min = 1.99999996. MOSEK's 0.2511 is a double-precision artifact.",
+  "files": {
+    "dat_s": "benchmark/nsps/nsps_aug_nu1p0.dat-s",
+    "ini_s": "benchmark/nsps/nsps_aug_nu1p0.ini-s",
+    "param_sdpa": "benchmark/nsps/nsps_aug_nu1p0_param.sdpa"
+  }
+}
