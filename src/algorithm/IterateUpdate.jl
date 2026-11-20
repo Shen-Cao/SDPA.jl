@@ -54,21 +54,22 @@ function _update_iterate!(pt::SDPASolution{T}, alpha::StepLength{T},
     failure = _NOT_POSDEF
     factors_touched = false
     for attempt in 0:_MAX_STEP_HALVINGS
-        if !(_trial_axpy!(x, pt.xMat, ap, newton.DxMat) &&
-             _trial_axpy!(z, pt.zMat, ad, newton.DzMat) &&
-             _trial_axpy!(y.ele, pt.yVec.ele, ad, newton.DyVec.ele))
+        if _trial_axpy!(x, pt.xMat, ap, newton.DxMat) &&
+           _trial_axpy!(z, pt.zMat, ad, newton.DzMat) &&
+           _trial_axpy!(y.ele, pt.yVec.ele, ad, newton.DyVec.ele)
+            factors_touched = true
+            err = _inverse_failure!(pt, x, z, work)
+            if err === nothing
+                pt.xMat, newton.r_zinvMat = x, pt.xMat
+                pt.zMat, newton.x_rd_zinvMat = z, pt.zMat
+                pt.yVec, newton.gvec = y, pt.yVec
+                # The trajectory and residual bookkeeping consume these values.
+                alpha.primal, alpha.dual = ap, ad
+                return max(ap, ad) < tiny ? _TINY_STEP : _MOVED
+            end
+            failure = err
+        else
             failure = _NONFINITE_STEP
-            break
-        end
-
-        factors_touched = true
-        if _inverse_for!(pt, x, z, work)
-            pt.xMat, newton.r_zinvMat = x, pt.xMat
-            pt.zMat, newton.x_rd_zinvMat = z, pt.zMat
-            pt.yVec, newton.gvec = y, pt.yVec
-            # The trajectory and residual bookkeeping consume these values.
-            alpha.primal, alpha.dual = ap, ad
-            return max(ap, ad) < tiny ? _TINY_STEP : _MOVED
         end
         (max(ap, ad) < tiny || attempt == _MAX_STEP_HALVINGS) && break
         ap /= 2
@@ -78,7 +79,7 @@ function _update_iterate!(pt::SDPASolution{T}, alpha::StepLength{T},
     # Trial factors may be partial. Rebuild the last accepted factors
     # only if ALL trials failed, not between retries or on ordinary steps.
     if factors_touched
-        compute_inverse!(pt, work) || error("last accepted iterate has no positive-definite factors")
+        compute_inverse!(pt, work) || error("last accepted iterate has no finite positive-definite factorization")
     end
     return failure
 end
@@ -104,20 +105,31 @@ iterate update. Also recomputes `invzMat` (the full Z⁻¹).
 For X: `invCholeskyX = L_x⁻¹` where `X = L_x · L_x'`.
 For Z: `invCholeskyZ = L_z⁻¹` and `invzMat = L_z'⁻¹ · L_z⁻¹ = Z⁻¹`.
 
-Returns `false` if either Cholesky fails (X or Z lost positive-
-definiteness). The caller must handle this (typically by breaking the
-main loop or reducing the step length).
+Returns `false` if either Cholesky fails or an inverse factor cannot be
+represented finitely at the working precision. A failing call may leave
+the caches partially written.
 
 Mirrors C++ `Solutions::computeInverse` at `sdpa_dataset.cpp:96-118`.
 """
 function compute_inverse!(
     current_pt::SDPASolution{T}, work::SDPAWorkVariables{T},
 ) where {T<:Real}
-    return _inverse_for!(current_pt, current_pt.xMat, current_pt.zMat, work)
+    return _inverse_failure!(current_pt, current_pt.xMat, current_pt.zMat, work) === nothing
 end
 
-# Write the factors of the supplied (possibly still tentative) matrices.
-function _inverse_for!(current_pt::SDPASolution{T}, x::SDPADenseLinearSpace{T},
+function _finite_blocks(M::SDPADenseLinearSpace)
+    all(isfinite, M.LP_block) || return false
+    for k in eachindex(M.SDP_block)
+        if isassigned(M.SDP_block, k)
+            all(isfinite, M.SDP_block[k].de_ele) || return false
+        end
+    end
+    return true
+end
+
+# Write and validate the factors of the (possibly tentative) matrices.
+# A finite, strictly PD input can still overflow when forming its inverse.
+function _inverse_failure!(current_pt::SDPASolution{T}, x::SDPADenseLinearSpace{T},
                        z::SDPADenseLinearSpace{T}, work::SDPAWorkVariables{T}) where {T<:Real}
     # Dispatch to threaded variant when multiple threads are available.
     if Threads.nthreads() > 1
@@ -125,28 +137,31 @@ function _inverse_for!(current_pt::SDPASolution{T}, x::SDPADenseLinearSpace{T},
             current_pt.invCholeskyX, x, work.DLS1,
         )
         if !ok_x
-            return false
+            return _NOT_POSDEF
         end
         ok_z = threaded_get_inv_chol_and_inv!(
             current_pt.invCholeskyZ, current_pt.invzMat, z, work.DLS2,
         )
         if !ok_z
-            return false
+            return _NOT_POSDEF
         end
     else
         ok_x = get_inv_chol!(
             current_pt.invCholeskyX, x, work.DLS1,
         )
         if !ok_x
-            return false
+            return _NOT_POSDEF
         end
         ok_z = get_inv_chol_and_inv!(
             current_pt.invCholeskyZ, current_pt.invzMat, z, work.DLS2,
         )
         if !ok_z
-            return false
+            return _NOT_POSDEF
         end
     end
 
-    return true
+    for M in (current_pt.invCholeskyX, current_pt.invCholeskyZ, current_pt.invzMat)
+        _finite_blocks(M) || return _NONFINITE_STEP
+    end
+    return nothing
 end

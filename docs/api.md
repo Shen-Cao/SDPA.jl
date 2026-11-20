@@ -82,7 +82,8 @@ failure, cannot move, time limit); this enum can. The MOI layer consumes
 it for `TerminationStatus` (`MAX_ITERATION` → `ITERATION_LIMIT`,
 `CHOLESKY_FAILURE`/`CANNOT_MOVE` → `OTHER_LIMIT`, `NONFINITE_STEP` →
 `NUMERICAL_ERROR`, `TIME_LIMIT` →
-`TIME_LIMIT`). If a proposed step loses positive definiteness, the solver
+`TIME_LIMIT`). If a proposed step loses positive definiteness or its inverse factors
+cannot be represented finitely, the solver
 halves the two step lengths together and checks again, at most twenty times.
 A failed candidate keeps the last accepted point. A strictly
 interior tiny step is counted, and its diagnostics are recomputed before

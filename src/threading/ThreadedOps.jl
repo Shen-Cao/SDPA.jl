@@ -305,28 +305,7 @@ function threaded_get_inv_chol_and_inv!(
             # capture (shared-accumulator race), so the nested @tasks
             # region is safe.
             Rgemm!("T", "N", n, n, n, one(T), L_inv, L_inv, zero(T), inv_blk)
-            if T <: BigFloat
-                # Value-copy: `inv_blk[i, j] = avg` would store the
-                # SAME BigFloat object in both transposed slots, so a
-                # later in-place MPFR op on one would corrupt the
-                # mirrored entry. Float64 is value-semantic.
-                # Scratch-based chain, bit-identical to
-                # `avg = (a + b) / 2` (one `+` rounding + exact halving).
-                avg_buf = sym_scratch[1]
-                two = sym_scratch[2]
-                @inbounds for j in 1:n, i in 1:j
-                    mp_add!(avg_buf, inv_blk[i, j], inv_blk[j, i])
-                    mp_div!(avg_buf, avg_buf, two)
-                    mp_set!(inv_blk[i, j], avg_buf)
-                    mp_set!(inv_blk[j, i], avg_buf)
-                end
-            else
-                @inbounds for j in 1:n, i in 1:j
-                    avg = (inv_blk[i, j] + inv_blk[j, i]) / 2
-                    inv_blk[i, j] = avg
-                    inv_blk[j, i] = avg
-                end
-            end
+            _symmetrize_inverse!(inv_blk, sym_scratch)
         end
     end
     @inbounds for k in eachindex(a_mat.LP_block)

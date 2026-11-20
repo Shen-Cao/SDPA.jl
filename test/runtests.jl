@@ -40,6 +40,7 @@ using GenericLinearAlgebra  # CRITICAL: must be loaded for BigFloat cholesky!/ei
     include("algorithm/test_iterate_acceptance.jl")
     include("algorithm/test_reverse_precision.jl")
     include("algorithm/test_step_recovery.jl")
+    include("algorithm/test_inverse_finiteness.jl")
     include("algorithm/test_arch0.jl")
     include("moi/test_moi_basic.jl")
     include("moi/test_objective_sense.jl")
