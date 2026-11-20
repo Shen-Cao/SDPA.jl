@@ -75,13 +75,16 @@ Enum for solver phase:
 
 Enum for why the IPM loop terminated (reported in
 `SolutionLog.exit_reason`): `OPTIMAL_TERMINAL`, `MAX_ITERATION`,
-`CHOLESKY_FAILURE`, `CANNOT_MOVE`, `TIME_LIMIT`, `EMPTY_PROBLEM`.
+`CHOLESKY_FAILURE`, `CANNOT_MOVE`, `TIME_LIMIT`, `EMPTY_PROBLEM`, `NONFINITE_STEP`.
 `terminal_phase` alone cannot distinguish a healthy terminal phase from
 one frozen mid-solve by a non-terminal exit (iteration budget, Cholesky
 failure, cannot move, time limit); this enum can. The MOI layer consumes
 it for `TerminationStatus` (`MAX_ITERATION` → `ITERATION_LIMIT`,
-`CHOLESKY_FAILURE`/`CANNOT_MOVE` → `OTHER_LIMIT`, `TIME_LIMIT` →
-`TIME_LIMIT`).
+`CHOLESKY_FAILURE`/`CANNOT_MOVE` → `OTHER_LIMIT`, `NONFINITE_STEP` →
+`NUMERICAL_ERROR`, `TIME_LIMIT` →
+`TIME_LIMIT`). A failed candidate keeps the last accepted point. A strictly
+interior tiny step is counted, and its diagnostics are recomputed before
+reporting stagnation.
 
 ### `NewtonState{T<:Real}`
 

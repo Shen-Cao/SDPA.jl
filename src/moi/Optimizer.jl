@@ -325,6 +325,8 @@ function MOI.get(opt::Optimizer, ::MOI.TerminationStatus)
     reason = opt.solution_log.exit_reason
     if reason === SDPA.MAX_ITERATION
         return MOI.ITERATION_LIMIT
+    elseif reason === SDPA.NONFINITE_STEP
+        return MOI.NUMERICAL_ERROR
     elseif reason === SDPA.CHOLESKY_FAILURE || reason === SDPA.CANNOT_MOVE
         return MOI.OTHER_LIMIT
     end

@@ -6,19 +6,12 @@ distinguish a healthy terminal phase from one frozen mid-solve by a
 non-terminal exit (maxIteration / Cholesky failure / cannot-move /
 time limit).
 
-Assignment rule: the loop starts at `OPTIMAL_TERMINAL` and every
-NON-terminal break overwrites it — `TIME_LIMIT` exactly where `timed_out`
-is set, `CHOLESKY_FAILURE` at the two `mehrotra!` failure breaks,
-`CANNOT_MOVE` when `update!` reports the iterate cannot move. The pdFEAS
-early stop (`beta.value > 5 || objP < objD`, C++ sdpa_main.cpp:337-340
-parity) is a healthy termination and keeps `OPTIMAL_TERMINAL`. The
-while-condition's `maxIteration` leg is not a break site, so it is
-disambiguated after the loop: `OPTIMAL_TERMINAL` is upgraded to
-`MAX_ITERATION` iff `continue_iter` was still true AND
-`iter >= params.maxIteration` (every mid-body break fires before the
-`iter` increment, so a break can never satisfy that inequality).
-`EMPTY_PROBLEM` is set by the trivial-problem early exit, before the
-loop ever runs.
+A terminal phase, including the C++ pdFEAS early-stop heuristic, uses
+`OPTIMAL_TERMINAL`. Otherwise the reason distinguishes an iteration
+or time limit, a failed Schur/iterate Cholesky (`CHOLESKY_FAILURE`),
+a non-finite candidate (`NONFINITE_STEP`), or a valid step so small
+that no further progress is expected (`CANNOT_MOVE`). Rejected steps
+are not counted and never replace the last accepted point.
 """
 @enum ExitReason begin
     OPTIMAL_TERMINAL
@@ -27,6 +20,7 @@ loop ever runs.
     CANNOT_MOVE
     TIME_LIMIT
     EMPTY_PROBLEM
+    NONFINITE_STEP
 end
 
 """
@@ -821,7 +815,15 @@ function _solve_inner_locked!(
             )
             t_eigen[] += time_ns() - t0
 
-            # --- LOG + STEP ---
+            # --- VALIDATE AND COMMIT STEP ---
+            outcome = _update_iterate!(current_pt, alpha, newton, work)
+            if outcome === _NOT_POSDEF || outcome === _NONFINITE_STEP
+                exit_reason = outcome === _NOT_POSDEF ? CHOLESKY_FAILURE : NONFINITE_STEP
+                break
+            end
+
+            # Log the accepted step against its *pre-step* scalars. A
+            # viable tiny step is included and gets the same bookkeeping.
             row = IterationRow{T}(
                 iter, mu.current, theta.primal, theta.dual,
                 solve_info.objValPrimal, solve_info.objValDual,
@@ -833,12 +835,6 @@ function _solve_inner_locked!(
                     row.iter, row.mu, row.thetaP, row.thetaD,
                     row.objP, row.objD, row.alphaP, row.alphaD, row.beta)
                 flush(io)
-            end
-            moved = update!(current_pt, alpha, newton, work)
-            if !moved
-                # "Cannot move" or Cholesky failure.
-                exit_reason = CANNOT_MOVE
-                break
             end
 
             # --- UPDATE BOOKKEEPING ---
@@ -871,16 +867,14 @@ function _solve_inner_locked!(
                 solve_info.rho,
                 params,
             )
+            if outcome === _TINY_STEP && continue_iter
+                exit_reason = CANNOT_MOVE
+                break
+            end
         end
 
-        # The while-condition's maxIteration leg is not a break site,
-        # so disambiguate it here. If no non-terminal reason was recorded,
-        # the loop was still willing to continue (continue_iter true —
-        # false means the terminal check won and OPTIMAL_TERMINAL stands,
-        # even when iter happens to equal maxIteration), and the budget is
-        # exhausted, the exit was MAX_ITERATION. Every mid-body break above
-        # fires BEFORE `iter += 1`, so at any break `iter < maxIteration`
-        # still holds — this inequality can only be met via the while leg.
+        # A terminal phase takes precedence when reached on the final
+        # allowed iteration; an explicitly recorded failure also stands.
         if exit_reason == OPTIMAL_TERMINAL && continue_iter &&
            iter >= params.maxIteration
             exit_reason = MAX_ITERATION
