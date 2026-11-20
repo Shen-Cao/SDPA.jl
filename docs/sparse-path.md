@@ -10,6 +10,10 @@ O(m²) storage and O(m³) Cholesky cost.
 ## When It Activates
 
 Decision in `src/sparse/AggregateSparsity.jl` → `analyze_sparsity`:
+with at least 100 constraints, a single packed LP block uses an exact
+diagonal profile if every constraint has a nonempty support and no LP
+scalar is used in more than one constraint. The dense fallback still
+handles empty rows and shared scalars. Otherwise:
 
 ```
 use_dense = m < 100 || nBlock < 5 || aggregate_density > 0.25

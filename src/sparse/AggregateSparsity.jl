@@ -13,7 +13,8 @@ This module:
 2. Decides whether to use sparse or dense Schur complement
 3. Computes a fill-reducing ordering via AMD
 
-Decision rule:
+A single LP block with disjoint nonempty row supports can use an
+exact diagonal Schur profile. Otherwise, the decision is:
   - if m < 100: dense
   - if nBlock < 5: dense
   - if aggregate_density > 0.25: dense
@@ -186,6 +187,30 @@ function compute_amd_ordering(adj::SparseMatrixCSC{Bool,Int})
     return AMD.amd(pattern)
 end
 
+# The LP Schur complement is A * diag(x ./ z) * A'. Each scalar
+# contributes an outer product of one column of A. If every nonempty row
+# uses only scalars that no other row uses, Schur B is diagonal in every
+# iteration. Require all rows to be nonempty so structural singularity
+# continues through the ordinary routing and failure path.
+function _has_diagonal_lp_schur(problem::SDPAProblem)
+    problem.nBlock == 1 && problem.blockStruct[1] < 0 || return false
+    problem.m <= lp_scalar_count(problem.blockStruct) || return false
+    seen = Set{Int}()
+    for Ai in problem.A
+        Ai.LP_nnz > 0 || return false
+        for k in 1:Ai.LP_nnz
+            v = Ai.LP_sp_val[k]
+            # Assembly uses stored incidences. Decline noncanonical
+            # explicit zeros rather than disagreeing with that graph.
+            isfinite(v) && !iszero(v) || return false
+            scalar = Ai.LP_sp_index[k]
+            scalar in seen && return false
+            push!(seen, scalar)
+        end
+    end
+    return true
+end
+
 """
     analyze_sparsity(problem; method=:metis) -> (use_dense::Bool, ordering::Vector{Int}, adj)
 
@@ -202,6 +227,12 @@ function analyze_sparsity(
 ) where {T<:Real}
     m = problem.m
     nBlock = problem.nBlock
+    # Retain the small-problem cutoff, but avoid a dense factor for a
+    # provably diagonal, structurally nonsingular single LP block.
+    if m >= 100 && _has_diagonal_lp_schur(problem)
+        return false, collect(1:m), spdiagm(0 => trues(m))
+    end
+
     # Early gate: when the m/nBlock pre-rules already route dense, the
     # position-level graph is dead work — its density can never change the
     # decision (mirror C++ sdpa_chordal.cpp:349 `m <= 100 || nBlock <= 5`).
