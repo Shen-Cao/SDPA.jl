@@ -90,11 +90,16 @@ interior tiny step is counted, and its diagnostics are recomputed before
 reporting stagnation.
 
 With no equality constraints, nonfinite objective coefficients raise an
-`ArgumentError`. In a forward, constraint-free solve, a semidefinite
-objective may be stored at higher BigFloat precision than the requested
-solve. The returned slack is rounded to solve precision, and
-`final_dual_res` includes this rounding. If it exceeds `epsilonDash`, the
-solver reports `pFEAS` and `CANNOT_MOVE` instead of a dual-feasible optimum.
+`ArgumentError`. A constraint-free objective can be stored at higher BigFloat
+precision than the requested solve. The shortcut rounds its slack to solve
+precision and reports the residual against the stored coefficients:
+`final_dual_res` in forward mode or `final_primal_res` in REVERSE display.
+If this exceeds `epsilonDash`, the solve reports `CANNOT_MOVE` instead of
+a two-sided optimum (`pFEAS` in forward mode, `dFEAS` in REVERSE).
+
+The SDP cone classification still uses working-precision eigenvalues.
+Near rank deficiency, rounding to fewer bits can change the sign of a
+boundary eigenvalue. Do not reduce precision when that distinction matters.
 
 ### `NewtonState{T<:Real}`
 

@@ -91,26 +91,36 @@ end
 # Parity with the C++ reference output: example1 → -41.9 (39 iters),
 # arch0 → +0.5665 (53 iters).
 
-"""Negate all entries of the objective matrix C in-place."""
-function _negate_C!(problem::SDPAProblem{T}) where {T<:Real}
+"""Write the negated stored coefficients into the independent objective copy."""
+function _negate_C!(problem::SDPAProblem{T}, source::SDPASparseLinearSpace{T}=problem.C,
+                    negate::F=(-)) where {T<:Real,F}
     for sdp_k in 1:problem.C.SDP_sp_nBlock
+        isassigned(source.SDP_sp_block, sdp_k) || continue
+        src = source.SDP_sp_block[sdp_k]
         blk = problem.C.SDP_sp_block[sdp_k]
         if blk.type === :sparse
             for nz in 1:blk.nonZeroEffect
-                blk.sp_ele[nz] = -blk.sp_ele[nz]
+                blk.sp_ele[nz] = negate(src.sp_ele[nz])
             end
         else
             for k in eachindex(blk.de_ele)
-                blk.de_ele[k] = -blk.de_ele[k]
+                blk.de_ele[k] = negate(src.de_ele[k])
             end
         end
     end
     # LP entries: iterate the compact nonzero list of C. Negating a
     # nonzero keeps it nonzero, so the compact form is preserved.
     for lp_pos in 1:problem.C.LP_nnz
-        problem.C.LP_sp_val[lp_pos] = -problem.C.LP_sp_val[lp_pos]
+        problem.C.LP_sp_val[lp_pos] = negate(source.LP_sp_val[lp_pos])
     end
     return problem
+end
+
+# Sign reversal itself is exact. For an m=0 certificate, retain the stored
+# source precision until C is compared with the actual working-precision slack.
+@inline function _negate_constraint_free_coefficient(v::BigFloat)
+    precision(v) <= precision(BigFloat) && return -v
+    return mp_neg!(BigFloat(0; precision=precision(v)), v)
 end
 
 # Shallow problem copy with a negated VALUE copy of C, so the
@@ -127,7 +137,11 @@ function _problem_with_negated_C(problem::SDPAProblem{T}) where {T<:Real}
         problem.b, C_copy, problem.A,
     )
     initialize_index!(problem_copy)
-    _negate_C!(problem_copy)
+    if T === BigFloat && problem.m == 0
+        _negate_C!(problem_copy, problem.C, _negate_constraint_free_coefficient)
+    else
+        _negate_C!(problem_copy)
+    end
     return problem_copy
 end
 
