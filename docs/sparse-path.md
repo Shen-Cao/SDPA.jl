@@ -152,7 +152,7 @@ profile-form Cholesky**, mirroring the blocked structure of the dense
 ```
 for each block-column j0 (nb=64):
     factor diagonal+within-block columns (serial chain across block-columns)
-    for each later block-column (parallel via OhMyThreads @tasks):
+    for each later block-column within the source block's skyline reach:
         apply outer-product updates from block-column j0
 ```
 

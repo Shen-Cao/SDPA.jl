@@ -1,6 +1,7 @@
 using SDPA
 using Test
 using LinearAlgebra
+using Random
 
 # Unit tests for sparse_cholesky! and solve_systems_sparse!.
 #
@@ -208,6 +209,59 @@ end
                 sb.sp_ele[k] = one(T)
             end
             @test_throws ErrorException SDPA.sparse_cholesky!(sb, di)
+        end
+    end
+end
+
+
+# A rank-one sweep visits every contribution directly in source-column
+# order, independent of the blocked scheduling and its reach calculation.
+function _unblocked_profile_reference!(mat, di)
+    for j in 1:mat.nRow
+        SDPA._sparse_cholesky_factor_range!(mat, di, j) || return false
+        for k in (di[j] + 1):(di[j + 1] - 1)
+            SDPA._sparse_profile_update!(mat, di, k)
+        end
+    end
+    return true
+end
+
+@testset "bounded trailing tiles preserve factors and solutions" begin
+    rng = MersenneTwister(26559)
+    m = 197 # crosses three full 64-column block boundaries
+    separated = collect(1:m)
+    separated[60:145] .= 145  # spills into two later tiles
+    separated[149:195] .= 195 # separate component, partial tile
+    late_exact = collect(1:m)
+    late_exact[63:128] .= 128 # a reach exactly at the end of a tile
+    setprecision(BigFloat, 160) do
+        for T in (Float64, BigFloat),
+            reach in (collect(1:m), min.(m, (1:m) .+ 3), separated, late_exact, fill(m, m))
+            A = SDPA._independent_zeros(T, m, m)
+            for j in 1:m
+                A[j, j] = T(8)
+                for i in (j + 1):reach[j]
+                    val = T(rand(rng, -16:16)) / T(1024)
+                    A[i, j] = val
+                    A[j, i] = val
+                end
+            end
+            profile, di = SDPA.profile_from_skyline!(reach, T)
+            SDPA._fill_sparse_values!(profile, A, collect(1:m), di)
+            expected = copy(profile)
+            @test _unblocked_profile_reference!(expected, di)
+            @test SDPA.sparse_cholesky!(profile, di)
+            @test isequal(profile.sp_ele, expected.sp_ele)
+            # Predictor/corrector use two right hand sides without touching
+            # the existing factor. Check each residual against the original matrix.
+            for _ in 1:2
+                rhs = T.(rand(rng, -8:8, m))
+                x = SDPA._independent_zeros(T, m)
+                SDPA.solve_systems_sparse!(x, profile, rhs, di)
+                tol = 1000 * eps(T)
+                @test norm(A * x - rhs, Inf) <= tol * norm(rhs, Inf)
+            end
+            @test isequal(profile.sp_ele, expected.sp_ele)
         end
     end
 end

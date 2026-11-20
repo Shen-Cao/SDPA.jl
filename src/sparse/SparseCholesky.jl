@@ -45,9 +45,9 @@ disjoint target range `j`), so they are parallelized:
     1/sqrt + sub-diagonal scaling), then apply its *within-block*
     updates (`targets ≤ c2`) — the `k1` loop over within-block targets
     is run with `@tasks`.
-  - Phase 2 (parallel over target block-columns): apply the *deferred*
-    updates (`targets > c2`) from all source ranges of the block.  Each
-    `@tasks` chunk owns one target block-column and iterates the source
+  - Phase 2 (parallel over reachable target block-columns): apply the
+    *deferred* updates (`targets > c2`) from all source ranges of the
+    block. Each target block-column is independent and visits the source
     ranges in increasing `i` order.
 
 The serial chain is only across block-columns (mirrors the blocked
@@ -229,6 +229,7 @@ function sparse_cholesky!(
     c1 = 1
     while c1 <= nDIM
         c2 = min(c1 + nb - 1, nDIM)
+        last_target = c2
 
         # Phase 1: factor each range of the block-column, applying its
         # within-block updates (targets j ≤ c2) immediately so a later
@@ -238,6 +239,8 @@ function sparse_cholesky!(
             a1 = diagonalIndex[i] + 1
             a2 = diagonalIndex[i + 1] - 1
             if a1 <= a2
+                # The last stored index is this column's maximum reach.
+                last_target = max(last_target, column_index[a2])
                 # Within-block targets form a prefix (sorted by column_index).
                 hi = searchsortedlast(column_index, c2, a1, a2, Base.Order.Forward)
                 if use_tasks && hi - a1 + 1 >= _SPARSE_CHOLESKY_PAR_MIN
@@ -253,12 +256,13 @@ function sparse_cholesky!(
             end
         end
 
-        # Phase 2: deferred updates from this block-column to trailing
-        # block-columns (> c2).  All target block-columns are independent.
-        if c2 < nDIM
+        # Phase 2: an update needs a source entry with its target column
+        # index. A block-column starting after last_target has no such
+        # entry for any i in c1:c2, so skipping it cannot change arithmetic.
+        if last_target > c2
             t0_first = c2 + 1
-            t0_last = ((nDIM - 1) ÷ nb) * nb + 1
-            if use_tasks
+            t0_last = ((last_target - 1) ÷ nb) * nb + 1
+            if use_tasks && t0_first < t0_last
                 @tasks for t0 in t0_first:nb:t0_last
                     @set split=:roundrobin
                     _sparse_cholesky_deferred_block!(
