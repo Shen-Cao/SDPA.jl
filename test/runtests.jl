@@ -53,6 +53,7 @@ using GenericLinearAlgebra  # CRITICAL: must be loaded for BigFloat cholesky!/ei
     include("sparse/test_sparse_cholesky.jl")
     include("sparse/test_sparse_lp_profile.jl")
     include("sparse/test_sparse_schur_divergence.jl")
+    include("sparse/test_schur_skyline.jl")
     include("sparse/test_ordering_routing.jl")
     include("sparse/test_routing_freeze.jl")
     include("algorithm/test_sparse_e2e.jl")

@@ -306,70 +306,30 @@ function build_skyline_from_problem!(
     m = problem.m
     skyline = collect(1:m)  # diagonal at minimum
 
-    # Iterate each SDP block; for each pair (k1, k2) of constraints
-    # touching that block, extend the skyline.
-    for l in 1:length(problem.SDP_nConstraint)
-        nC_l = problem.SDP_nConstraint[l]
-        nC_l <= 1 && continue
-        constrs = problem.SDP_constraint[l]
-        for k1 in 1:nC_l
-            i = constrs[k1]
-            p_i = reverse_ordering[i]
-            for k2 in (k1+1):nC_l
-                j = constrs[k2]
-                p_j = reverse_ordering[j]
-                ii = min(p_i, p_j)
-                jj = max(p_i, p_j)
-                if jj > skyline[ii]
-                    skyline[ii] = jj
-                end
+    # Each SDP block or LP scalar induces a clique on its constraints.
+    # For any member, the only edge that matters to the envelope is its
+    # edge to the largest permuted index. Walk the incidence lists twice,
+    # instead of enumerating all pairs in each clique.
+    for constraint_lists in (problem.SDP_constraint, problem.LP_constraint)
+        for constraints in constraint_lists
+            length(constraints) <= 1 && continue
+            hi = 0
+            for i in constraints
+                hi = max(hi, reverse_ordering[i])
+            end
+            for i in constraints
+                j = reverse_ordering[i]
+                skyline[j] = max(skyline[j], hi)
             end
         end
     end
 
-    # Iterate each LP scalar position; same connectivity (C++
-    # makeGraph's LP merge, sdpa_chordal.cpp:204-211). The LP tables are
-    # sized per LP scalar (SDPAProblem.jl) and contain only constraints
-    # with a nonzero LP value in `LP_constraint[l]` — exactly
-    # the pairs `_compute_bmat_sparse_lp!` emits.
-    for l in 1:length(problem.LP_nConstraint)
-        nC_l = problem.LP_nConstraint[l]
-        nC_l <= 1 && continue
-        constrs = problem.LP_constraint[l]
-        for k1 in 1:nC_l
-            i = constrs[k1]
-            p_i = reverse_ordering[i]
-            for k2 in (k1+1):nC_l
-                j = constrs[k2]
-                p_j = reverse_ordering[j]
-                ii = min(p_i, p_j)
-                jj = max(p_i, p_j)
-                if jj > skyline[ii]
-                    skyline[ii] = jj
-                end
-            end
-        end
-    end
-
-    # Fill-in closure (C++ `Chordal`/symbfac semantics, sdpa_newton.cpp:
-    # 225-340): the skyline must contain every position the Cholesky
-    # factor needs, not just the original B connectivity.  If column i's
-    # envelope reaches row j (i < j ≤ skyline[i]), the elimination of i
-    # emits updates to column j that touch every row ≤ skyline[i], so
-    # column j's envelope must reach at least skyline[i] — otherwise the
-    # profile-form Cholesky silently drops genuine fill-in and produces
-    # an inexact factor.
-    #
-    # This is the symbolic-factorization envelope of the ordered graph,
-    # computed to a fixed point (processing columns in increasing order
-    # makes each `skyline[i]` final before it is used as a source).
-    @inbounds for i in 1:m
-        hi = skyline[i]
-        for j in (i + 1):hi
-            if skyline[j] < hi
-                skyline[j] = hi
-            end
-        end
+    # Column j-1's closed reach is the maximum of the preceding reaches.
+    # If that reach is at least j, its update must extend column j to that
+    # row as well. Otherwise it cannot change skyline[j], which is >= j.
+    # Thus the exact fill-closed envelope is one inclusive prefix maximum.
+    @inbounds for j in 2:m
+        skyline[j] = max(skyline[j], skyline[j - 1])
     end
 
     return skyline
