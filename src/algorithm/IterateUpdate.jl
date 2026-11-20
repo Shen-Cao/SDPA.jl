@@ -9,6 +9,10 @@ and `Solutions::computeInverse` at `:96-118`.
 # rejected candidate. Only accepted points may enter the solution log.
 @enum _IterateResult _MOVED _TINY_STEP _NOT_POSDEF _NONFINITE_STEP
 
+# The ordinary proposal is at most 100. Twenty halvings take even that
+# below the existing 1e-4 stagnation threshold.
+const _MAX_STEP_HALVINGS = 20
+
 function _trial_axpy!(out::AbstractArray{T}, x::AbstractArray{T}, alpha::T,
                       dx::AbstractArray{T}) where {T<:Real}
     finite = true
@@ -37,27 +41,46 @@ after the corrector direction is recovered and the next predictor writes
 them before reading them. No trial point aliases the current iterate.
 Validate the candidate via the *usual* inverse Cholesky computation: the
 accepted first-try path does not require an extra factorization or copy.
-A viable tiny step is still applied, matching the C++ stagnation rule.
+If the estimate missed negative curvature, halve both step lengths together
+and retry from the original point. Stop after the first viable step, an
+invalid tiny step, or the hard retry limit. A viable tiny step is still
+applied, matching the C++ stagnation rule.
 """
 function _update_iterate!(pt::SDPASolution{T}, alpha::StepLength{T},
                           newton::NewtonState{T}, work::SDPAWorkVariables{T}) where {T<:Real}
     x, z, y = newton.r_zinvMat, newton.x_rd_zinvMat, newton.gvec
-    if !(_trial_axpy!(x, pt.xMat, alpha.primal, newton.DxMat) &&
-         _trial_axpy!(z, pt.zMat, alpha.dual, newton.DzMat) &&
-         _trial_axpy!(y.ele, pt.yVec.ele, alpha.dual, newton.DyVec.ele))
-        return _NONFINITE_STEP
+    ap, ad = alpha.primal, alpha.dual
+    tiny = T(1e-4)
+    failure = _NOT_POSDEF
+    factors_touched = false
+    for attempt in 0:_MAX_STEP_HALVINGS
+        if !(_trial_axpy!(x, pt.xMat, ap, newton.DxMat) &&
+             _trial_axpy!(z, pt.zMat, ad, newton.DzMat) &&
+             _trial_axpy!(y.ele, pt.yVec.ele, ad, newton.DyVec.ele))
+            failure = _NONFINITE_STEP
+            break
+        end
+
+        factors_touched = true
+        if _inverse_for!(pt, x, z, work)
+            pt.xMat, newton.r_zinvMat = x, pt.xMat
+            pt.zMat, newton.x_rd_zinvMat = z, pt.zMat
+            pt.yVec, newton.gvec = y, pt.yVec
+            # The trajectory and residual bookkeeping consume these values.
+            alpha.primal, alpha.dual = ap, ad
+            return max(ap, ad) < tiny ? _TINY_STEP : _MOVED
+        end
+        (max(ap, ad) < tiny || attempt == _MAX_STEP_HALVINGS) && break
+        ap /= 2
+        ad /= 2
     end
 
-    if !_inverse_for!(pt, x, z, work)
-        # Candidate factors may have been partially written. Restore them
-        # from the unmodified last accepted X and Z on this failure path.
+    # Trial factors may be partial. Rebuild the last accepted factors
+    # only if ALL trials failed, not between retries or on ordinary steps.
+    if factors_touched
         compute_inverse!(pt, work) || error("last accepted iterate has no positive-definite factors")
-        return _NOT_POSDEF
     end
-    pt.xMat, newton.r_zinvMat = x, pt.xMat
-    pt.zMat, newton.x_rd_zinvMat = z, pt.zMat
-    pt.yVec, newton.gvec = y, pt.yVec
-    return max(alpha.primal, alpha.dual) < T(1e-4) ? _TINY_STEP : _MOVED
+    return failure
 end
 
 """

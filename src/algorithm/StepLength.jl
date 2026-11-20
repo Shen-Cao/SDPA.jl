@@ -13,7 +13,8 @@ The step lengths are computed by the fraction-to-boundary rule:
   α = min(α_max, -1/λ_min(L · Δ · L'))
 
 where L is the inverse Cholesky factor of X (or Z) and Δ is the Newton
-direction. This guarantees X + α·Δx ⪰ 0 (and Z + α·Δz ⪰ 0).
+direction. For large blocks a Lanczos estimate proposes this boundary;
+the iterate update validates positive definiteness and can shorten the step.
 """
 mutable struct StepLength{T<:Real}
     primal::T
