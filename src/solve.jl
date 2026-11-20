@@ -287,40 +287,19 @@ function solve!(
     # part of the public API.
     _test_throw_after_blas::Bool=false,
 ) where {T<:Real}
-    # Never mutate the caller's problem. With the REVERSE
-    # convention the solver needs -C internally (C++ sdpa_tool.h:84), so
-    # solve a shallow copy whose C is a negated value copy. The caller's
-    # problem is left untouched on every path, making solve! safe to call
-    # concurrently on the same problem object.
-    if reverse_primal_dual
-        problem = _problem_with_negated_C(problem)
-    else
-        # This path solves the caller's problem object directly. Readers
-        # and MOI ingest populate the derived aggregate index tables, but
-        # a manually constructed SDPAProblem never has initialize_index!
-        # called — with empty tables the solve would silently produce a
-        # zero Schur complement, wrong objectives, and noINFO. Populate
-        # the tables if they were never initialized (derived data only;
-        # no user-visible mutation).
-        _ensure_index_tables!(problem)
-    end
-    if T <: BigFloat
-        log = setprecision(BigFloat, params.precision) do
-            return _solve_inner!(problem, params, verbose, io, force_sparse, init;
-                                 time_limit_sec=time_limit_sec,
-                                 _test_throw_after_blas=_test_throw_after_blas)
-        end
-    else
-        log = _solve_inner!(problem, params, verbose, io, force_sparse, init;
+    # Negation, independent value copies and display arithmetic all allocate
+    # their BigFloat destinations at the current precision. Keep the entire
+    # raw solve, not just Newton iterations, in the requested scope.
+    function run()
+        # Input A/b are read-only. In REVERSE mode only C is copied/negated;
+        # otherwise a manually built problem may need its derived indices.
+        p = reverse_primal_dual ? _problem_with_negated_C(problem) : _ensure_index_tables!(problem)
+        log = _solve_inner!(p, params, verbose, io, force_sparse, init;
                             time_limit_sec=time_limit_sec,
                             _test_throw_after_blas=_test_throw_after_blas)
+        return reverse_primal_dual ? _reverse_display(log) : log
     end
-    # Apply the REVERSE display transformation whenever reverse_primal_dual
-    # is set (regardless of the solve's terminal phase).
-    if reverse_primal_dual
-        log = _reverse_display(log)
-    end
-    return log
+    return T === BigFloat ? setprecision(run, BigFloat, params.precision) : run()
 end
 
 # ---------------------------------------------------------------------------
