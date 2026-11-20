@@ -1,7 +1,6 @@
-function _manual_mixed_storage_problem(::Type{T}) where {T<:Real}
+function _manual_mixed_storage_problem(::Type{T}; repeat_sparse=false) where {T<:Real}
     # x₁₁ = 1, tr(X) = 3, and each of fourteen independent LP entries is 1.
-    # The objective is 2x₁₁ + x₂₂ + sum(lp) = 18. The single coupled pair
-    # stays under the sparse profile's density gate in any ordering.
+    # The objective is 2x₁₁ + x₂₂ + sum(lp) = 18.
     m, nlp = 16, 14
     blocks = [2, -nlp]
     function space(kind)
@@ -16,8 +15,11 @@ function _manual_mixed_storage_problem(::Type{T}) where {T<:Real}
     # Exercise raw dense writes as well as the setter, with no prior
     # sparse-to-dense conversion to populate the structural metadata.
     A[1].SDP_sp_block[1].de_ele[1, 1] = one(T)
-    SDPA.setelement_sdp!(A[2], 1, 1, 1, one(T))
-    SDPA.setelement_sdp!(A[2], 1, 2, 2, one(T))
+    repeats = repeat_sparse ? 2 : 1
+    for _ in 1:repeats
+        SDPA.setelement_sdp!(A[2], 1, 1, 1, one(T) / repeats)
+        SDPA.setelement_sdp!(A[2], 1, 2, 2, one(T) / repeats)
+    end
     SDPA.setelement_sdp!(A[3], 1, 1, 1, one(T))
     SDPA.change_to_dense!(A[3].SDP_sp_block[1]; force=true)
     SDPA.setzero!(A[3].SDP_sp_block[1])  # a converted but now empty block
@@ -46,14 +48,18 @@ end
         SDPA.compute_bmat_dense!(newton, problem, pt, work)
         @test newton.bmat.de_ele[1:2, 1:2] == T[1 1; 1 2]
 
-        # Require the sparse assembly to actually run: force_sparse alone
-        # can fall back to dense when the block profile exceeds its gate.
+        # force_sparse alone can fall back to dense, depending on the
+        # width of the Schur profile in the ordering chosen by METIS.
         params = SDPA.Parameters{T}(lambdaStar=one(T))
         p_dense = _manual_mixed_storage_problem(T)  # lazy index construction
         dense = SDPA.solve!(p_dense, params; verbose=false, reverse_primal_dual=false)
-        sparse = @test_logs (:info, r"Block-level profile:") match_mode=:any SDPA.solve!(
-            problem, params; verbose=true, io=devnull, reverse_primal_dual=false,
-            force_sparse=true)
+        sparse = withenv("SDPA_FORCE_SPARSE_PROFILE" => "1") do
+            # Both messages mark actual profile allocation, below or
+            # above the density gate, not just entry to sparsity routing.
+            @test_logs (:info, r"Block-level profile:|FORCED sparse profile") match_mode=:any SDPA.solve!(
+                problem, params; verbose=true, io=devnull, reverse_primal_dual=false,
+                force_sparse=true)
+        end
         @test dense.terminal_phase == sparse.terminal_phase == SDPA.pdOPT
         for log in (dense, sparse)
             @test isapprox(log.final_obj_primal, T(18); rtol=params.epsilonStar)
@@ -66,5 +72,23 @@ end
         problem.A[4].SDP_sp_block[1].de_ele[2, 2] = one(T)
         SDPA.initialize_index!(problem)
         @test problem.SDP_constraint[1] == [2, 4]
+    end
+end
+
+@testset "Repeated sparse triplets can own a dense/sparse Schur pair" begin
+    for T in (Float64, BigFloat)
+        problem = _manual_mixed_storage_problem(T; repeat_sparse=true)
+        SDPA.initialize_index!(problem)
+        # Equal weights and the larger constraint index give the sparse
+        # block ownership of the pair. F3 cannot consume the dense neighbor.
+        @test problem.A[1].SDP_sp_block[1].nonZeroEffect ==
+              problem.A[2].SDP_sp_block[1].nonZeroEffect == 4
+        newton = SDPA.NewtonState{T}(problem.m, problem.blockStruct)
+        work = SDPA.SDPAWorkVariables{T}(problem.blockStruct)
+        pt = SDPA.SDPASolution{T}(problem.m, problem.blockStruct, one(T))
+        SDPA.compute_formula!(newton, problem)
+        @test newton.useFormula[2, 1] in (:F1, :F2)
+        SDPA.compute_bmat_dense!(newton, problem, pt, work)
+        @test newton.bmat.de_ele[1:2, 1:2] == T[1 1; 1 2]
     end
 end
