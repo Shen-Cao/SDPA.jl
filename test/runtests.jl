@@ -36,6 +36,7 @@ using GenericLinearAlgebra  # CRITICAL: must be loaded for BigFloat cholesky!/ei
     include("algorithm/test_StepLength.jl")
     include("algorithm/test_IterateUpdate.jl")
     include("algorithm/test_solve.jl")
+    include("algorithm/test_result_invariants.jl")
     include("algorithm/test_arch0.jl")
     include("moi/test_moi_basic.jl")
     include("moi/test_objective_sense.jl")

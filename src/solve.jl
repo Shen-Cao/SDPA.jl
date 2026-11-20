@@ -513,10 +513,19 @@ function _solve_inner_locked!(
                 end
             end
             if semidefinite
-                for lp_k in 1:z.LP_nBlock
-                    if get_lp_value(problem.C, lp_k) < 0
+                # Z = C on LP coordinates too. Missing compact entries are
+                # already zero in z; copy the stored values independently.
+                for pos in 1:problem.C.LP_nnz
+                    lp_k = problem.C.LP_sp_index[pos]
+                    v = problem.C.LP_sp_val[pos]
+                    if v < 0
                         semidefinite = false
                         break
+                    end
+                    if T === BigFloat
+                        mp_set!(z.LP_block[lp_k], v)
+                    else
+                        z.LP_block[lp_k] = v
                     end
                 end
             end
