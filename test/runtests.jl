@@ -19,6 +19,7 @@ using GenericLinearAlgebra  # CRITICAL: must be loaded for BigFloat cholesky!/ei
     include("types/test_sparse_matrix_copy.jl")
     include("types/test_linear_space.jl")
     include("types/test_SDPAProblem.jl")
+    include("types/test_dense_sdp_indexing.jl")
     include("types/test_solution_residuals_workvars.jl")
     include("test_Parameters.jl")
     include("io/test_read_dat_s.jl")

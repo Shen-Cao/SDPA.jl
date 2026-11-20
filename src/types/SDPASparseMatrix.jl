@@ -15,11 +15,13 @@ cost model:
   - `nonZeroCount`:       memory actually allocated (current capacity)
   - `nonZeroEffect`:      currently-stored nonzeros (in use)
 
-The three are kept distinct because `changeToDense!` triggers when the
+For sparse storage the three are kept distinct because `changeToDense!` triggers when the
 "density" = `nonZeroEffect / (nRow*nCol)` exceeds ~20% (C++
 `sdpa_struct.cpp:491`), and we need to know the *current usage*
 distinct from the *allocated capacity* to avoid reallocating on every
-insertion.
+insertion. For dense storage all three are the number of dense slots, as
+used by the Schur formula cost model. They don't indicate whether all
+of the stored values happen to be zero.
 
 Fields
 ------
@@ -65,12 +67,14 @@ mutable struct SDPASparseMatrix{T<:Real}
         (type === :sparse || type === :dense) ||
             error("type must be :sparse or :dense, got $type")
         de_ele = type === :dense ? _independent_zeros(T, nRow, nCol) : Matrix{T}(undef, 0, 0)
-        row_idx = type === :sparse ? zeros(Int, nonZeroNumber) : Int[]
-        col_idx = type === :sparse ? zeros(Int, nonZeroNumber) : Int[]
-        sp_ele = type === :sparse ? _independent_zeros(T, nonZeroNumber) : T[]
+        if type === :dense
+            n = length(de_ele)
+            return new{T}(nRow, nCol, type, n, n, n, de_ele, Int[], Int[], T[])
+        end
         return new{T}(
             nRow, nCol, type, nonZeroNumber, nonZeroNumber, 0,
-            de_ele, row_idx, col_idx, sp_ele,
+            de_ele, zeros(Int, nonZeroNumber), zeros(Int, nonZeroNumber),
+            _independent_zeros(T, nonZeroNumber),
         )
     end
 end
@@ -203,7 +207,7 @@ at `sdpa_struct.cpp:491`.
 
 After conversion: `de_ele` is a `Matrix{T}` of size `(nRow, nCol)`
 (column-major). Index arrays are released. `nonZeroNumber/Count/Effect`
-retain their meaning.
+become the number of dense slots.
 
 If `force=true`, converts regardless of density.
 """
