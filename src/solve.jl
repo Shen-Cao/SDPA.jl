@@ -378,6 +378,31 @@ function _solve_inner!(
     end
 end
 
+# The m=0 shortcut certifies the point directly; NaN/Inf is not a
+# semidefinite coefficient or an unboundedness certificate. Validate all
+# stored coordinates BEFORE an early negative block can bypass later data.
+function _check_constraint_free_objective(C::SDPASparseLinearSpace)
+    for k in eachindex(C.SDP_sp_block)
+        isassigned(C.SDP_sp_block, k) || continue
+        block = C.SDP_sp_block[k]
+        vals = block.type === :dense ? block.de_ele : view(block.sp_ele, 1:block.nonZeroEffect)
+        all(isfinite, vals) || throw(ArgumentError(
+            "constraint-free objective C must be finite (SDP block $(C.SDP_sp_index[k]))"))
+    end
+    for pos in 1:C.LP_nnz
+        isfinite(C.LP_sp_val[pos]) || throw(ArgumentError(
+            "constraint-free objective C must be finite (LP coordinate $(C.LP_sp_index[pos]))"))
+    end
+    return nothing
+end
+
+# Equal-or-lower-precision inputs copy exactly. Avoid allocating BigFloat
+# temporaries for each matrix entry in the usual same-precision solve.
+@inline function _constraint_free_roundoff(res::BigFloat, src::BigFloat, dst::BigFloat)
+    precision(src) <= precision(dst) && return res
+    return max(res, abs(src - dst))
+end
+
 function _solve_inner_locked!(
     problem::SDPAProblem{T}, params::Parameters{T},
     verbose::Bool, io::IO, force_sparse::Bool=false,
@@ -415,6 +440,7 @@ function _solve_inner_locked!(
             copy(init)
         # Trivial-problem early exit, m == 0: with no constraints the
         # problem min ⟨C, X⟩ s.t. X ⪰ 0 is decidable without any IPM work.
+        problem.m == 0 && _check_constraint_free_objective(problem.C)
         if problem.m == 0 && current_pt.nDim == 0
             # Nothing to optimize at all: no constraints and no variables.
             # The general path would run the full allocation +
@@ -459,7 +485,9 @@ function _solve_inner_locked!(
                 end
             end
             semidefinite = true
+            dual_res = zero(T)
             for k in eachindex(problem.C.SDP_sp_index)
+                isassigned(problem.C.SDP_sp_block, k) || continue
                 l = problem.C.SDP_sp_index[k]
                 pos = sdp_slot_of_block[l]
                 smat = problem.C.SDP_sp_block[k]
@@ -479,7 +507,14 @@ function _solve_inner_locked!(
                         dense[c, r] = v
                     end
                 end
-                _copyto_independent!(z.SDP_block[pos].de_ele, dense)
+                z_block = z.SDP_block[pos].de_ele
+                _copyto_independent!(z_block, dense)
+                if T === BigFloat
+                    # Stored input can have higher precision than the solve.
+                    for idx in eachindex(dense, z_block)
+                        dual_res = _constraint_free_roundoff(dual_res, dense[idx], z_block[idx])
+                    end
+                end
                 if min_eigen_qr_block(dense) < 0
                     semidefinite = false
                     break
@@ -497,6 +532,7 @@ function _solve_inner_locked!(
                     end
                     if T === BigFloat
                         mp_set!(z.LP_block[lp_k], v)
+                        dual_res = _constraint_free_roundoff(dual_res, v, z.LP_block[lp_k])
                     else
                         z.LP_block[lp_k] = v
                     end
@@ -504,21 +540,24 @@ function _solve_inner_locked!(
             end
             if semidefinite
                 x0 = SDPADenseLinearSpace{T}(problem.blockStruct)  # X = 0
+                # X=0 attains the primal optimum. The best representable
+                # Z=round(C) may nevertheless miss the requested dual tolerance.
+                dual_feasible = dual_res <= params.epsilonDash
                 return SolutionLog{T}(
                     0,                     # iterations: decidable, no IPM work
-                    pdOPT,                 # optimum 0 at X = 0, Z = C
+                    dual_feasible ? pdOPT : pFEAS,
                     IterationRow{T}[],
                     zero(T),               # ⟨C, 0⟩ = 0
                     zero(T),               # ⟨b=∅, y⟩ = 0
                     zero(T),               # ⟨0, C⟩/nDim = 0
                     zero(T),               # no constraints: primal residual 0
-                    zero(T),               # Z = C exactly: dual residual 0
+                    dual_res,              # actual residual of the returned Z
                     x0,
                     copy(current_pt.yVec), # empty
-                    z,                     # Z = C (the optimal dual slack)
+                    z,                     # C at the requested precision
                     (mehrotra=0.0, eigen=0.0, residual=0.0, total=0.0),
                     false,
-                    OPTIMAL_TERMINAL,
+                    dual_feasible ? OPTIMAL_TERMINAL : CANNOT_MOVE,
                 )
             end
         end

@@ -89,6 +89,13 @@ A failed candidate keeps the last accepted point. A strictly
 interior tiny step is counted, and its diagnostics are recomputed before
 reporting stagnation.
 
+With no equality constraints, nonfinite objective coefficients raise an
+`ArgumentError`. In a forward, constraint-free solve, a semidefinite
+objective may be stored at higher BigFloat precision than the requested
+solve. The returned slack is rounded to solve precision, and
+`final_dual_res` includes this rounding. If it exceeds `epsilonDash`, the
+solver reports `pFEAS` and `CANNOT_MOVE` instead of a dual-feasible optimum.
+
 ### `NewtonState{T<:Real}`
 
 Internal state for one Newton iteration. Not typically accessed by
