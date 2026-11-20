@@ -30,9 +30,19 @@ using Test
     )
 
     opt = SDPA.Optimizer{Float64}(silent=true)
+    for Status in (MOI.PrimalStatus, MOI.DualStatus)
+        @test MOI.get(opt, Status(1)) == MOI.NO_SOLUTION
+        @test MOI.get(opt, Status(2)) == MOI.NO_SOLUTION
+    end
     MOI.optimize!(opt, src)
 
     @test MOI.get(opt, MOI.TerminationStatus()) == MOI.OPTIMAL
+    @test MOI.get(opt, MOI.ResultCount()) == 1
+    for Status in (MOI.PrimalStatus, MOI.DualStatus)
+        @test MOI.get(opt, Status(1)) == MOI.FEASIBLE_POINT
+        @test MOI.get(opt, Status(2)) == MOI.NO_SOLUTION
+    end
+    @test_throws MOI.ResultIndexBoundsError MOI.get(opt, MOI.VariablePrimal(2), x[1])
     @test MOI.get(opt, MOI.ObjectiveValue()) ≈ 1.0 atol=1e-6
     # Check primal values
     x1_val = MOI.get(opt, MOI.VariablePrimal(), x[1])

@@ -349,8 +349,8 @@ function _moi_primal_status(phase::SDPA.PhaseValue)
     end
 end
 
-function MOI.get(opt::Optimizer, ::MOI.PrimalStatus)
-    if opt.solution_log === nothing
+function MOI.get(opt::Optimizer, attr::MOI.PrimalStatus)
+    if attr.result_index != 1 || opt.solution_log === nothing
         return MOI.NO_SOLUTION
     end
     return _moi_primal_status(opt.solution_log.terminal_phase)
@@ -371,8 +371,8 @@ function _moi_dual_status(phase::SDPA.PhaseValue)
     end
 end
 
-function MOI.get(opt::Optimizer, ::MOI.DualStatus)
-    if opt.solution_log === nothing
+function MOI.get(opt::Optimizer, attr::MOI.DualStatus)
+    if attr.result_index != 1 || opt.solution_log === nothing
         return MOI.NO_SOLUTION
     end
     return _moi_dual_status(opt.solution_log.terminal_phase)
