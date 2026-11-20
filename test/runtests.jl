@@ -16,6 +16,7 @@ using GenericLinearAlgebra  # CRITICAL: must be loaded for BigFloat cholesky!/ei
     include("env.jl")
     include("smoke_parser.jl")
     include("types/test_core_types.jl")
+    include("types/test_sparse_matrix_copy.jl")
     include("types/test_linear_space.jl")
     include("types/test_SDPAProblem.jl")
     include("types/test_solution_residuals_workvars.jl")
