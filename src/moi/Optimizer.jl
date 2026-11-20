@@ -604,29 +604,24 @@ function MOI.get(opt::Optimizer{T}, attr::MOI.ConstraintDual,
                  ci::MOI.ConstraintIndex) where {T<:Real}
     opt.solution_log === nothing && throw(MOI.GetAttributeNotAllowed(attr))
     MOI.check_result_index_bounds(opt, attr)
-    # For MAX_SENSE the solver internally minimizes ⟨-C,X⟩, so its duals
-    # (y, Z) are duals of the NEGATED problem. MOI's convention is ∂V/∂b
-    # for the problem as stated, which flips the sign — the same negation
-    # DualObjectiveValue already applies.
-    negate = opt.objective_sense === MOI.MAX_SENSE
+    # MOI keeps constraint duals in the same dual cone for either sense.
+    # For max ⟨C,X⟩, ingestion already changes the stationarity equation
+    # to -C = A'y + Z. These y and Z are the MOI duals; only the
+    # objective values change sign when converting back from min to max.
     if haskey(opt._eq_ci_map, ci)
-        y = opt.solution_log.yVec.ele[opt._eq_ci_map[ci]]
-        return negate ? _scalar_value(-y) : _scalar_value(y)
+        return _scalar_value(opt.solution_log.yVec.ele[opt._eq_ci_map[ci]])
     elseif haskey(opt._reals_ci_vars, ci)
         # The dual of the free-variable cone constraint is zero.
         return _independent_zeros(T, length(opt._reals_ci_vars[ci]))
     elseif haskey(opt._psd_ci_map, ci)
         blk = opt._psd_ci_map[ci]
         # zMat = Z (dual slack) with reverse_primal_dual=false
-        v = _dense_to_triangle_vector(opt.solution_log.zMat.SDP_block[blk].de_ele)
-        return negate ? -v : v
+        return _dense_to_triangle_vector(opt.solution_log.zMat.SDP_block[blk].de_ele)
     elseif haskey(opt._lp_ci_positions, ci)
         # LP cone — THIS CI's slice of zMat.LP_block, at the same LP
-        # positions its variables occupy (see copy_to). Value copy;
-        # negated under MAX_SENSE (sign convention above).
-        v = _copy_independent(
+        # positions its variables occupy (see copy_to). Return a value copy.
+        return _copy_independent(
             opt.solution_log.zMat.LP_block[opt._lp_ci_positions[ci]])
-        return negate ? -v : v
     elseif ci in opt._constraint_cis
         # Copied CI filtered from the solver state (redundant equality after
         # ingest's linking pass) — its dual is zero.

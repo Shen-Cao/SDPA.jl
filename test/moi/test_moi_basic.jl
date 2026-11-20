@@ -205,10 +205,8 @@ end
         lp_dual = MOI.get(opt, MOI.ConstraintDual(), lp_ci)
         @test lp_dual isa Vector{Float64}
         @test length(lp_dual) == 2  # 2 LP variables
-        # At optimality both LP duals are nonneg (complementarity).
-        # Don't assert sign — the dual sign convention depends on
-        # reverse_primal_dual. Just verify nonzero real values.
-        @test any(!iszero, lp_dual)
+        # The dual of Nonnegatives is Nonnegatives for either sense.
+        @test minimum(lp_dual) >= -1e-6
     end
 end
 
@@ -260,10 +258,8 @@ end
         @test cd_b ≈ [1.0, 0.0, 0.0] atol=1e-5
     end
 
-    @testset "MAX_SENSE: sliced dual is negated (sign convention)" begin
-        # Same model with the objective negated (max -(a1+b1)): the solver
-        # internally solves the IDENTICAL min-form problem, so zMat matches
-        # the MIN run — H1's negation must flip the SLICED duals too.
+    @testset "MAX_SENSE: sliced cone duals stay nonnegative" begin
+        # max -(a1+b1) has the same conic duals as min a1+b1.
         src, ci_a, ci_b = build_two_cone_model(Float64, MOI.MAX_SENSE)
         opt = SDPA.Optimizer{Float64}(silent=true)
         MOI.optimize!(opt, src)
@@ -272,8 +268,8 @@ end
         cd_a = MOI.get(opt, MOI.ConstraintDual(), ci_a)
         cd_b = MOI.get(opt, MOI.ConstraintDual(), ci_b)
         @test length(cd_a) == 2 && length(cd_b) == 3
-        @test cd_a ≈ [-1.0, 0.0] atol=1e-5
-        @test cd_b ≈ [-1.0, 0.0, 0.0] atol=1e-5
+        @test cd_a ≈ [1.0, 0.0] atol=1e-5
+        @test cd_b ≈ [1.0, 0.0, 0.0] atol=1e-5
     end
 
     @testset "PSD(1)-routed CI returns its single value" begin

@@ -230,6 +230,14 @@ MOI.get(opt, SDPA.DualSlackMatrix())       # Vector{Matrix{T}}
 `ConstraintDual`, `RawStatusString`, `RawOptimizerAttribute`,
 `SolveTimeSec`.
 
+`ConstraintDual` follows [MOI's conic dual convention](https://jump.dev/MathOptInterface.jl/stable/background/duality/).
+Equivalent formulations `min f` and `max -f` have the same constraint
+duals: a dual to a `Nonnegatives` constraint is nonnegative and a dual
+to a PSD constraint is positive semidefinite in either formulation.
+Objective values are reported in the requested sense. For the change
+in an LP objective when a constraint is relaxed, use JuMP's
+`shadow_price`, not the raw conic dual.
+
 ### `RawOptimizerAttribute`
 
 Set any parameter field by name:
