@@ -393,7 +393,7 @@ def campaign(args):
         "schema_version": 1, "mode": mode, "accuracy_target": str(args.target),
         "verify_guard_digits": args.guard_digits, "start": "cold default lambdaStar*I",
         "timing": "fresh child wall until exit, including startup/JIT/read/solve/witness serialization; validation excluded",
-        "rss": "native monitor's wait4 ru_maxrss in bytes, not aggregate process-tree or Python-launcher RSS",
+        "rss": "wait4 ru_maxrss in bytes; can include the maximum of reaped descendants, not a process-tree sum or Python RSS",
         "input": path_info(common_input) | {"original_path": str(args.input.resolve()),
                                           "m": len(problem.b), "blocks": problem.blocks},
         "parameters": path_info(common_params) | {

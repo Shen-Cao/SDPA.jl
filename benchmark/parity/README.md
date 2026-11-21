@@ -137,9 +137,11 @@ rather than silently interpreted differently by the two readers.
   problem read, solving, and witness serialization. It excludes the offline
   validator (its cost is recorded separately). Native solver timing fields
   have different boundaries and are diagnostic only. Peak RSS is the
-  waited child's Linux maximum, not allocated bytes, a process-tree memory
-  sum, or the Python driver's memory. Timeouts retain elapsed deadline
-  evidence but not a fabricated completed-run RSS/time.
+  Linux `wait4` high-water mark for the waited child (which can include
+  reaped descendants), not allocated bytes, a process-tree memory sum,
+  or the Python driver's memory. The child CPU counters can also include
+  waited descendants. Timeouts retain elapsed deadline evidence but not
+  a fabricated completed-run RSS/time.
 * `manifest.json` pins input/binary/parameter/harness/environment provenance;
   `results.jsonl` keeps every run in seeded interleaved order; the per-run
   directories retain witness, timing record, and native logs. `summary.json`
