@@ -104,6 +104,21 @@ fills `useFormula::Matrix{Symbol}` per (constraint, block), indexed
 never selected for dense blocks (asserted in `compute_formula!`, C++
 `sdpa_newton.cpp:768-774`).
 
+The cost heuristic's integer input is the inclusive prefix of
+`nonZeroEffect` in lexicographic `(weight, original_constraint_id)` order.
+Compute it in linear time for already ordered active lists, otherwise use a
+temporary sorted key buffer. Neither the incidence lists nor the order of
+the formula arithmetic and destination writes change. A block must contain
+at most one active incidence per original constraint; repeated matrix
+triplets are different and still count toward their matrix's weight.
+
+For those distinct IDs, the sparse table keeps its diagonal and exactly
+one orientation of each off-diagonal pair. A checked triangular capacity
+therefore replaces the separate pair-counting traversal. The emission
+order, numeric assembly, and table storage are unchanged. See
+[Schur planning benchmarks](../benchmark/schur_planning.md) for measuring
+setup costs separately from whole solves.
+
 For BigFloat, the F1/F2/F3 inner products use in-place `mpfr_fma!`
 (via `mp_fma!` wrappers) for zero-allocation accumulation. See
 [Threading](threading.md) for performance details.
