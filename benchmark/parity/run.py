@@ -89,6 +89,8 @@ def binary_info(cpp, build, requested, env):
             raise Invalid("C++ build record does not match the pinned source and supplied binary")
         if record.get("gmp_sha256") != info["gmp"]["sha256"]:
             raise Invalid("C++ build record does not match the GMP library resolved for this run")
+        if record.get("openmp", {}).get("sha256") != info["openmp"]["sha256"]:
+            raise Invalid("C++ build record does not match the OpenMP library resolved for this run")
         info["source"] = "pinned source; supplied build record and binary/library hashes agree"
         info["build_record"] = record
     return info
@@ -106,11 +108,17 @@ def parameter_text(template, requested_bits, iteration_override, digits):
     rows[10] = str(requested_bits)
     if not 1 <= int(rows[0]) <= 2**31 - 1:
         raise Invalid("maxIteration outside the positive C++ int range")
+    controls = []
     for token in rows[1:10]:
         original = decimal(token)
         value = float(token)
         if not math.isfinite(value) or (value == 0 and original != 0):
             raise Invalid(f"parameter underflows or overflows the upstream double: {token}")
+        controls.append(value)
+    eps, initial, omega, lower, upper, beta, beta_bar, gamma, eps_dash = controls
+    if not (eps > 0 and initial > 0 and omega > 1 and lower < upper
+            and 0 < beta <= beta_bar < 1 and 0 < gamma < 1 and eps_dash > 0):
+        raise Invalid("native numeric controls are outside SDPA.jl's supported ranges")
     rendered = "".join(f"{value}  {key}\n" for value, key in zip(rows, CONTROLS))
     rendered += "".join(f"%+.{digits}Fe  {field}\n" for field in ("xPrint", "XPrint", "YPrint", "infPrint"))
     return dict(zip(CONTROLS, rows)), rendered
@@ -182,7 +190,14 @@ def run_child(measure, command, directory, env, cpus, timeout):
         return result | {"wall_seconds": None, "peak_rss_bytes": None, "exit_code": None}
     if proc.returncode != 0:
         raise OSError(f"measurement supervisor exited with {proc.returncode}")
-    return result | json.loads(report.read_text(encoding="utf-8"))
+    measurements = json.loads(report.read_text(encoding="utf-8"))
+    if measurements["finished_monotonic_ns"] > deadline:
+        # pidfd readiness alone only means "already finished"; a delayed
+        # Python observer may wake after a late completion. Compare the
+        # native monitor's actual elapsed interval to the same deadline.
+        return result | {"timed_out": True, "timeout_detail": "late completion",
+                         "wall_seconds": None, "peak_rss_bytes": None, "exit_code": None}
+    return result | measurements
 
 
 def julia_route(stderr):
@@ -299,8 +314,8 @@ def options(argv):
     work.add_argument("--max-iter", type=positive, help="override template cap for matched accuracy")
     work.add_argument("--fixed-iterations", type=positive, help="diagnostic only; not a speed-to-solution claim")
     args = p.parse_args(argv)
-    if not 16 <= args.bits <= 4096 or not 16 <= (args.julia_bits or args.bits) <= 4096:
-        p.error("use 16–4096 arithmetic bits")
+    if not 64 <= args.bits <= 4096 or not 64 <= (args.julia_bits or args.bits) <= 4096:
+        p.error("use 64–4096 arithmetic bits (enough to represent binary64 controls)")
     if not math.isfinite(args.timeout) or not 0 < args.timeout <= 604800:
         p.error("--timeout must be positive and at most seven days per child")
     return args

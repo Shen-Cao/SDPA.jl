@@ -42,21 +42,37 @@ class Problem:
 
 
 def read_problem(path):
-    lines = iter(enumerate(Path(path).read_text(encoding="ascii").splitlines(), 1))
+    raw = Path(path).read_bytes().decode("ascii")
+    if re.search(r"[^\x20-\x7e\t\r\n]|\r(?!\n)", raw):
+        raise Invalid("expected ASCII .dat-s with LF or CRLF line endings")
+    lines = iter(enumerate(raw.splitlines(keepends=True), 1))
     first = next(lines, None)
     # The C++ reader recognizes comments only at column 1, before the header.
     while first and first[1].startswith(('"', '*')):
+        if len(first[1]) > 255:
+            raise Invalid("comment exceeds the pinned C++ reader's 255-byte line limit")
         first = next(lines, None)
     header = [first, next(lines, None), next(lines, None)]
     if any(line is None or not line[1].strip() for line in header):
         raise Invalid("expected three separate nonempty dimension lines")
-    fields = [line.split("=", 1)[0].split() for _, line in header[:2]]
-    fields.append(re.sub(r"[{},]", " ", header[2][1].split("=", 1)[0]).split())
+    if len(first[1]) > 255:
+        raise Invalid("mDIM exceeds the pinned C++ reader's 255-byte line limit")
+    fields = []
+    for k, (row, line) in enumerate(header):
+        data, sep, label = line.rstrip("\r\n").partition("=")
+        # For nBLOCK and blockStruct the C++ positional scanner can read a
+        # digit or sign in a label as the *next* number. Julia discards
+        # some of these suffixes. Only permit unambiguous annotations.
+        if sep and not re.fullmatch(r"[A-Za-z_]+(?:[ \t]+[A-Za-z_]+)*", label.strip()):
+            raise Invalid(f"line {row}: dimension labels must contain only ASCII words")
+        fields.append((re.sub(r"[{},]", " ", data) if k == 2 else data).split())
     if len(fields[0]) != 1 or len(fields[1]) != 1:
         raise Invalid("expected separate mDIM and nBLOCK lines")
     m, n = integers(fields[0] + fields[1])
     blocks = integers(fields[2])
-    if m <= 0 or n <= 0 or len(blocks) != n or 0 in blocks:
+    if not (0 < m < 2**31 and 0 < n < 2**31) or len(blocks) != n or any(
+        not 0 < abs(bs) < 2**31 for bs in blocks
+    ):
         raise Invalid("expected positive dimensions and nonzero signed blocks")
     # The pinned C++ fscanf scans for a digit or sign before each numeric
     # field (bare '.5' could be interpreted as '5', unlike Julia).
@@ -173,7 +189,7 @@ def read_witness(path, problem, solver):
     if not xv.start() < xm.start() < ym.start():
         raise Invalid("out-of-order displayed witness")
     head = text[:xv.start()]
-    phase = marker(head, r"^phase\.value[ \t]*=[ \t]*([A-Za-z]+)[ \t]*$", "phase")[1]
+    phase = marker(head, r"^phase\.value[ \t]*=[ \t]*([A-Za-z_]+)[ \t]*$", "phase")[1]
     steps = int(marker(head, r"^[ \t]*Iteration[ \t]*=[ \t]*([0-9]+)[ \t]*$", "iteration")[1])
     metadata = {}
     fields = {"precision": r"[0-9]+"}
@@ -243,10 +259,9 @@ def reported_ratio(numerator, denominator):
         return numerator / denominator
 
 
-def cone_gate(matrix, tolerance, guard):
-    """Sufficient check for lambda_min(sym(matrix)) >= -tol*(1+||matrix||_inf)."""
+def cone_gate(matrix, tolerance, guard, scale):
+    """Sufficient check for lambda_min(sym(matrix)) >= -tol*input_scale."""
     n = len(matrix)
-    scale = ONE + max(sum(map(abs, row), ZERO) for row in matrix)
     skew = max(abs(matrix[i][j] - matrix[j][i]) for i in range(n) for j in range(i + 1))
     sym = [[(matrix[i][j] + matrix[j][i]) / TWO for j in range(i + 1)] for i in range(n)]
     shift = tolerance * scale / TWO
@@ -306,7 +321,7 @@ def validate(problem, witness, tolerance, guard):
     number_stream = chain(b, [tolerance], x, values(X, blocks), values(Y, blocks),
                           *(entry.values() for entry in entries))
     with localcontext() as ctx:
-        ctx.prec = exact_precision(number_stream, 3, 2 + sum(len(e) for e in entries)
+        ctx.prec = exact_precision(number_stream, 3, 2 + len(b) + sum(len(e) for e in entries)
                                    + sum(bs * bs if bs >= 2 else abs(bs) for bs in blocks))
         slack = {}
         dual_res = ZERO
@@ -342,9 +357,11 @@ def validate(problem, witness, tolerance, guard):
                         trace += P[i][j] * Q[i][j]
         primal_obj = sum((value * item for value, item in zip(b, x)), ZERO)
         objective_scale = ONE + abs(primal_obj) + abs(dual_obj)
+        primal_scale = ONE + max(map(abs, entries[0].values()), default=ZERO)
+        dual_scale = ONE + max(map(abs, b), default=ZERO)
         magnitudes = {
-            "primal_residual": (primal_res, ONE + max(map(abs, entries[0].values()), default=ZERO)),
-            "dual_residual": (dual_res, ONE + max(map(abs, b), default=ZERO)),
+            "primal_residual": (primal_res, primal_scale),
+            "dual_residual": (dual_res, dual_scale),
             "relative_gap": (abs(primal_obj - dual_obj), objective_scale),
             "complementarity": (abs(trace), objective_scale),
         }
@@ -353,13 +370,16 @@ def validate(problem, witness, tolerance, guard):
         result["primal_objective"] = str(primal_obj)
         result["dual_objective"] = str(dual_obj)
 
-        for axis, matrices in (("primal", X), ("dual", Y)):
+        # A candidate must not set its own accuracy budget. A huge value
+        # on a free direction could otherwise hide a negative eigenvalue,
+        # negative LP scalar, or skew that is large in the problem's units.
+        for axis, matrices, scale in (("primal", X, primal_scale), ("dual", Y, dual_scale)):
             symmetry, cone, skew = True, True, ZERO
             for bs, mat in zip(blocks, matrices):
                 if bs < 2:
-                    cone &= min(mat) >= -tolerance * (ONE + max(map(abs, mat)))
+                    cone &= min(mat) >= -tolerance * scale
                 else:
-                    symmetric, psd, defect = cone_gate(mat, tolerance, guard)
+                    symmetric, psd, defect = cone_gate(mat, tolerance, guard, scale)
                     symmetry &= symmetric
                     cone &= psd
                     skew = max(skew, defect)

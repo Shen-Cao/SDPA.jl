@@ -51,10 +51,11 @@ int main(int argc, char **argv) {
     }
     int wrote = fprintf(report,
         "{\"wall_seconds\":%.9f,\"peak_rss_bytes\":%lld,\"user_cpu_seconds\":%.6f,"
-        "\"system_cpu_seconds\":%.6f,\"exit_code\":%d}\n",
+        "\"system_cpu_seconds\":%.6f,\"exit_code\":%d,\"finished_monotonic_ns\":%lld}\n",
         elapsed, 1024LL * usage.ru_maxrss,
         usage.ru_utime.tv_sec + 1e-6 * usage.ru_utime.tv_usec,
-        usage.ru_stime.tv_sec + 1e-6 * usage.ru_stime.tv_usec, exit_code);
+        usage.ru_stime.tv_sec + 1e-6 * usage.ru_stime.tv_usec, exit_code,
+        1000000000LL * end.tv_sec + end.tv_nsec);
     if (fclose(report) != 0 || wrote < 0) {
         perror("writing measurement");
         return 2;

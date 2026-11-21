@@ -39,7 +39,7 @@ build with upstream Autotools (`autoreconf --force --install`,
 a build record is intentionally labeled **unattested**; it can be useful
 locally but does not establish a comparison against pinned source. Use only
 a trusted local executable. The runner rejects a build record whose SHA or
-binary/GMP digests disagree with the run.
+binary/GMP/OpenMP digests disagree with the run.
 
 `--project` lets you select a separate instantiated project/manifest, but the
 Julia worker rejects one that resolves SDPA.jl from a different checkout.
@@ -96,21 +96,26 @@ The two affine residuals are maximum-entry defects scaled by
 `1 + max(|F_0|)` and `1 + max(|b|)`, respectively. The absolute objective
 gap and `|<X,Y>|` are scaled by `1 + |b'x| + |<F_0,Y>|`; an off-diagonal
 coefficient acts on both matrix entries. Comparisons are performed on the
-decimal values before rounding displayed ratios. For each SDP block, check
-symmetry and the cone against `target * (1 + ||block||_∞)`, where the
-matrix norm is the largest absolute row sum. The independent Decimal
+decimal values before rounding displayed ratios. For each SDP or LP block,
+check against `target * (1 + max(|F_0|))` for the primal witness and
+`target * (1 + max(|b|))` for the dual witness. These are **input-only**
+scales: a large unrelated witness entry cannot hide a negative eigenvalue,
+negative LP value, or skew. SDP symmetry uses the maximum absolute
+entrywise difference from the transpose. The independent Decimal
 Cholesky candidate uses a half-tolerance diagonal shift, and passes only
-if its exactly recomputed reconstruction error in that same norm is
+if its exactly recomputed reconstruction error (largest absolute row sum) is
 within the remaining half. Diagonal dominance is also a sufficient
-certificate. LP checks use signed scalars scaled by `1 + max(|block|)`.
+certificate. LP blocks check each signed entry.
 These are conservative numerical witness checks, not exact optimality or
 infeasibility proofs. The offline verifier is cubic in each nontrivial
 PSD block and is intended for bounded benchmark cases, not huge dense
 certification runs.
 
 Input support is unambiguous sparse SDP/LP `.dat-s`: separate dimension
-lines with optional `= label`, leading column-1 comments, nonzero signed
-blocks, objective vector, and upper-triangle entries. Duplicates,
+lines with optional `= label` (ASCII words, no signs or digits),
+column-1 leading comments and mDIM lines at most 255 bytes including the
+line ending, nonzero signed blocks, objective vector, and upper-triangle
+entries. Duplicates,
 truncation, nonfinite values and unsupported shape variants are rejected
 rather than silently interpreted differently by the two readers.
 

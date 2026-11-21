@@ -6,8 +6,10 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 from types import SimpleNamespace
 import unittest
+from unittest.mock import patch
 
 from run import REPO, assess, cpu_set, parameter_text, run_child
 from witness import Invalid, cone_gate, read_problem, read_witness, validate
@@ -119,15 +121,47 @@ class ParityOracle(unittest.TestCase):
     def test_shifted_cone_margin_and_skew(self):
         with localcontext() as ctx:
             ctx.prec = 100
-            s, c, _ = cone_gate([[D("1"), D(2)], [D(2), D(4)]], D("1e-35"), 80)
+            s, c, _ = cone_gate([[D("1"), D(2)], [D(2), D(4)]], D("1e-35"), 80, D(1))
             self.assertTrue(s and c)  # non-diagonally-dominant rank-one PSD
-            s, c, _ = cone_gate([[D(1), D(3)], [D(2), D(9)]], D("1e-35"), 80)
+            s, c, _ = cone_gate([[D(1), D(3)], [D(2), D(9)]], D("1e-35"), 80, D(1))
             self.assertFalse(s)
             self.assertTrue(c)       # symmetry isn't silently repaired to a pass
             s, c, _ = cone_gate([[D(1), D("1.0000000001")],
-                                [D("1.0000000001"), D(1)]], D("1e-12"), 80)
+                                [D("1.0000000001"), D(1)]], D("1e-12"), 80, D(1))
             self.assertTrue(s)
             self.assertFalse(c)
+
+    def test_large_unrelated_witness_cannot_relax_cone_budget(self):
+        # F1=diag(1,0), x=0 and X=0. Y can satisfy the affine equation
+        # Y11=-1 only by leaving the cone. A huge Y22 cannot mask that.
+        for sizes, zero, false_Y in [
+            ("2", "{{0,0},{0,0}}", "{{-1,0},{0,1e40}}"),
+            ("-2", "{0,0}", "{-1,1e40}"),
+        ]:
+            with self.subTest(sizes=sizes):
+                data = f"1\n1\n{sizes}\n-1\n1 1 1 1 1\n"
+                display = f"xVec =\n{{0}}\nxMat =\n{{{zero}}}\nyMat =\n{{{false_Y}}}\n"
+                p, path = self.files(data=data, result=julia_text(display))
+                result = validate(p, read_witness(path, p, "julia"), D("1e-30"), 100)
+                for key in ("relative_gap", "primal_residual", "dual_residual", "complementarity"):
+                    self.assertEqual(D(result[key]), D(0))
+                self.assertFalse(result["dual_cone"])
+                self.assertFalse(result["accuracy_passed"])
+
+    def test_large_unrelated_witness_cannot_relax_symmetry_budget(self):
+        data = "1\n1\n3\n1\n1 1 1 1 1\n"
+        display = """xVec =
+{0}
+xMat =
+{ {{0,0,0},{0,0,0},{0,0,0}} }
+yMat =
+{ {{1,1,0},{-1,0,0},{0,0,1e40}} }
+"""
+        p, path = self.files(data=data, result=julia_text(display))
+        result = validate(p, read_witness(path, p, "julia"), D("1e-30"), 100)
+        self.assertTrue(result["dual_cone"])
+        self.assertFalse(result["dual_symmetric"])
+        self.assertFalse(result["accuracy_passed"])
 
     def test_input_digits_beyond_binary64_change_the_verdict(self):
         p, path = self.files(data=MIXED.replace("\n1\n0", "\n1.000000000000000000000000000000000000000000005\n0"),
@@ -156,10 +190,16 @@ class ParityOracle(unittest.TestCase):
     def test_shared_input_rejects_incompatible_or_ambiguous_data(self):
         for data in (SDP + "1 1 2 1 1\n", SDP + "1 1 1 1 2\n", SDP + "1 1 1\n",
                      "\n" + SDP, SDP.replace("\n6\n", "\n.6\n"),
-                     MIXED + "1 1 1 2 3\n", SDP.replace("1 1 2 2 2", "1 1 2 2 NaN")):
+                     MIXED + "1 1 1 2 3\n", SDP.replace("1 1 2 2 2", "1 1 2 2 NaN"),
+                     SDP.replace("nBLOCK", "nBLOCKv2"), SDP.replace("= blocks", "= x-1"),
+                     '"' + 'c' * 254 + "\n" + SDP, " " * 255 + SDP, SDP.replace("\n6\n", "\r6\n"),
+                     SDP.replace("\n6\n", "\n6\0\n")):
             with self.subTest(data=data):
                 with self.assertRaises(Invalid):
                     self.files(data=data)
+        data = SDP.replace("\n", "\r\n")
+        p, _ = self.files(data=data)
+        self.assertEqual((p.blocks, p.b), ((2,), (D(6),)))
 
     def test_shell_success_not_enough_and_fixed_iterations_not_accuracy(self):
         args = SimpleNamespace(threads=1, bits=256, target=D("1e-30"), guard_digits=80,
@@ -168,6 +208,7 @@ class ParityOracle(unittest.TestCase):
         cases = [
             ("solver_status", julia_text(reason="CHOLESKY_FAILURE"), None),
             ("solver_status", julia_text(phase="pdINF"), None),
+            ("solver_status", julia_text(phase="pFEAS_dINF"), None),
             ("invalid_result", julia_text().replace("{-2}", "{NaN}"), None),
             ("accuracy_failed", julia_text(DISPLAY.replace("{-2}", "{-1}")), None),
             ("invalid_result", julia_text().replace("threads = 1", "threads = 9"), None),
@@ -226,6 +267,34 @@ class MeasurementBoundary(unittest.TestCase):
             self.assertLess(row["external_elapsed_seconds"], 5)
             self.assertIsNone(row["peak_rss_bytes"])
             self.assertEqual((kill_dir / "stdout.log").read_bytes(), b"")
+
+    def test_deadline_uses_actual_completion_not_delayed_observation(self):
+        with tempfile.TemporaryDirectory() as t:
+            tmp = Path(t)
+            helper = tmp / "measure"
+            subprocess.run(["cc", "-o", str(helper), str(Path(__file__).with_name("measure_child.c"))],
+                           check=True)
+            pidfd_open = os.pidfd_open
+
+            def delayed_open(pid):
+                fd = pidfd_open(pid)
+                time.sleep(0.25)
+                return fd
+
+            cpus = cpu_set(None, 1)
+            env = dict(os.environ)
+            with patch("run.os.pidfd_open", delayed_open):
+                d = tmp / "on_time"
+                d.mkdir()
+                on_time = run_child(helper, ["/bin/true"], d, env, cpus, 0.18)
+                self.assertGreater(on_time["external_elapsed_seconds"], 0.18)
+                self.assertFalse(on_time["timed_out"])
+                d = tmp / "late"
+                d.mkdir()
+                late = run_child(helper, ["/bin/sleep", "0.14"], d, env, cpus, 0.05)
+                self.assertTrue(late["timed_out"])
+                self.assertEqual(late["timeout_detail"], "late completion")
+                self.assertIsNone(late["wall_seconds"])
 
 
 if __name__ == "__main__":
