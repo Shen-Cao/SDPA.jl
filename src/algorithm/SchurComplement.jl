@@ -499,7 +499,8 @@ Cost model (per constraint i, SDP block l):
 
 Selection:
   - If A_i block is DENSE: use F1 if f1 < f2, else F2. NEVER F3.
-  - If A_i block is SPARSE: use the min of {f1, f2, f3}.
+  - If A_i block is SPARSE: use the min of {f1, f2, f3}, unless its
+    triplet count can cause it to own a pair with a dense neighbor.
 """
 function compute_formula!(
     newton_state::NewtonState{T}, problem::SDPAProblem{T};
@@ -545,8 +546,11 @@ function compute_formula!(
             f2 = kappa * n * inz + kappa * (n + 1) * up
             f3 = (2 * kappa * inz + 1) * up
 
-            if Ai_block.type === :dense
-                # DENSE: only F1 or F2 (never F3).
+            if Ai_block.type === :dense || inz >= n * Ai_block.nCol
+                # Both operands of F3 must be sparse. Ordinarily a dense
+                # block owns every dense/sparse pair because its weight is
+                # the full slot count. A manually assembled sparse block
+                # with repeated triplets may match or exceed that weight.
                 newton_state.useFormula[i, l] = (f1 < f2) ? :F1 : :F2
             else
                 # SPARSE: min of {f1, f2, f3}.

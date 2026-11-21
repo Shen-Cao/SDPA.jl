@@ -106,9 +106,10 @@ reader records a block only when it carries a value != 0
 (sdpa_io.cpp:539, 550); the Julia readers allocate every SDP block as
 an empty shell, so the SDP filter must happen here:
 
-- For SDP blocks the per-A_i sub-block is a sparse matrix; "nonzero"
-  means `nonZeroEffect > 0` (at least one stored entry). Blocks the
-  reader never allocated (`isassigned` false) are empty by definition.
+- For sparse SDP blocks, at least one stored triplet is required. For
+  dense SDP blocks, inspect the dense values, not the storage counter
+  used by the Schur cost model. Blocks the reader never allocated
+  (`isassigned` false) are empty by definition.
 - For LP blocks the per-A_i sub-block is a compact nonzero list
   (`LP_nnz` / `LP_sp_index` / `LP_sp_val`); every stored entry is nonzero
   by construction, so iterating the compact list is the filter.
@@ -132,7 +133,7 @@ function initialize_index!(problem::SDPAProblem{T}) where {T<:Real}
         # problem-level block indices (Ai.SDP_sp_index[k] is the original
         # blockStruct index for the k-th SDP entry of A_i).
         for sdp_k in 1:Ai.SDP_sp_nBlock
-            # Skip unallocated or zero-nonzero (empty) blocks — C++
+            # Skip unallocated or empty blocks — C++
             # SparseLinearSpace keeps only blocks with NonZeroNumber > 0
             # (sdpa_struct.cpp:885-912), so C++ initialize_index never
             # sees them. The isassigned guard MUST come first —
@@ -142,7 +143,14 @@ function initialize_index!(problem::SDPAProblem{T}) where {T<:Real}
                 continue
             end
             block = Ai.SDP_sp_block[sdp_k]
-            block.nonZeroEffect == 0 && continue
+            if block.type === :dense
+                # Direct access to de_ele is allowed, so a cached nonzero
+                # flag could become stale. Scan once per index build and
+                # stop on the first nonzero, not during Schur assembly.
+                any(!iszero, block.de_ele) || continue
+            else
+                block.nonZeroEffect == 0 && continue
+            end
             global_k = Ai.SDP_sp_index[sdp_k]
             push!(problem.SDP_constraint[global_k], i)
             push!(problem.SDP_blockIndex[global_k], sdp_k)

@@ -4,11 +4,9 @@
 A sparse-or-dense matrix with element type `T`. Mirrors C++
 `sdpa::SparseMatrix` at `sdpa_struct.h:72-109`.
 
-The C++ class carries both layouts simultaneously and converts between
-them via `changeToDense`. We mirror that exact structure: a `:sparse`
-matrix has row/column index arrays plus values; a `:dense` matrix has a
-flat `de_ele::Vector{T}` (NOT a `Matrix{T}` — the C++ storage is a flat
-pointer, and `changeToDense!` reallocates it as `nRow*nCol`).
+The C++ class carries both layouts and converts between them via
+`changeToDense`. A Julia `:sparse` matrix has row/column index arrays plus
+values; a `:dense` matrix has a column-major `de_ele::Matrix{T}`.
 
 Three "non-zero counters" track different things in the C++ F1/F2/F3
 cost model:
@@ -17,11 +15,13 @@ cost model:
   - `nonZeroCount`:       memory actually allocated (current capacity)
   - `nonZeroEffect`:      currently-stored nonzeros (in use)
 
-The three are kept distinct because `changeToDense!` triggers when the
+For sparse storage the three are kept distinct because `changeToDense!` triggers when the
 "density" = `nonZeroEffect / (nRow*nCol)` exceeds ~20% (C++
 `sdpa_struct.cpp:491`), and we need to know the *current usage*
 distinct from the *allocated capacity* to avoid reallocating on every
-insertion.
+insertion. For dense storage all three are the number of dense slots, as
+used by the Schur formula cost model. They don't indicate whether all
+of the stored values happen to be zero.
 
 Fields
 ------
@@ -67,12 +67,14 @@ mutable struct SDPASparseMatrix{T<:Real}
         (type === :sparse || type === :dense) ||
             error("type must be :sparse or :dense, got $type")
         de_ele = type === :dense ? _independent_zeros(T, nRow, nCol) : Matrix{T}(undef, 0, 0)
-        row_idx = type === :sparse ? zeros(Int, nonZeroNumber) : Int[]
-        col_idx = type === :sparse ? zeros(Int, nonZeroNumber) : Int[]
-        sp_ele = type === :sparse ? _independent_zeros(T, nonZeroNumber) : T[]
+        if type === :dense
+            n = length(de_ele)
+            return new{T}(nRow, nCol, type, n, n, n, de_ele, Int[], Int[], T[])
+        end
         return new{T}(
             nRow, nCol, type, nonZeroNumber, nonZeroNumber, 0,
-            de_ele, row_idx, col_idx, sp_ele,
+            de_ele, zeros(Int, nonZeroNumber), zeros(Int, nonZeroNumber),
+            _independent_zeros(T, nonZeroNumber),
         )
     end
 end
@@ -108,11 +110,9 @@ function setidentity!(m::SDPASparseMatrix{T}, scalar::Real=one(T)) where {T<:Rea
         end
     else
         # Sparse: reset to n diagonal entries.
-        if length(m.row_index) < n
-            resize!(m.row_index, n)
-            resize!(m.column_index, n)
-            resize!(m.sp_ele, n)
-        end
+        resize!(m.row_index, n)
+        resize!(m.column_index, n)
+        resize!(m.sp_ele, n)
         for i in 1:n
             m.row_index[i] = i
             m.column_index[i] = i
@@ -135,31 +135,37 @@ function Base.copyto!(dst::SDPASparseMatrix{T}, src::SDPASparseMatrix{T}) where 
     dst.nCol == src.nCol || throw(DimensionMismatch("nCol mismatch"))
     dst.type === src.type ||
         error("copyto! type mismatch: $(dst.type) vs $(src.type); call change_to_dense! first")
+    dst === src && return dst
+
+    if src.type === :dense
+        # Dense counters can be nonzero, but there is no sparse payload.
+        size(src.de_ele) == size(src) && size(dst.de_ele) == size(dst) ||
+            throw(DimensionMismatch("dense payload size does not match matrix dimensions"))
+        _copyto_independent!(dst.de_ele, src.de_ele)
+    elseif src.type === :sparse
+        cap = src.nonZeroCount
+        n = src.nonZeroEffect
+        0 <= n <= cap || throw(ArgumentError("invalid sparse in-use count"))
+        length(src.row_index) == length(src.column_index) == length(src.sp_ele) == cap ||
+            throw(DimensionMismatch("sparse payload lengths do not match allocated capacity"))
+
+        # A grown BigFloat source can have undefined values past n. Keep the
+        # full allocated capacity, with independent, initialized dst values,
+        # and only read src values from the in-use prefix.
+        resize!(dst.row_index, cap)
+        resize!(dst.column_index, cap)
+        resize!(dst.sp_ele, cap)
+        copyto!(dst.row_index, src.row_index)
+        copyto!(dst.column_index, src.column_index)
+        _fill_independent!(dst.sp_ele, zero(T))
+        _copy_prefix_independent!(dst.sp_ele, src.sp_ele, n)
+    else
+        throw(ArgumentError("unknown matrix representation $(src.type)"))
+    end
+
     dst.nonZeroNumber = src.nonZeroNumber
     dst.nonZeroCount = src.nonZeroCount
     dst.nonZeroEffect = src.nonZeroEffect
-    _copyto_independent!(dst.de_ele, src.de_ele)
-    # src's sparse arrays may be capacity-grown (resize!-doubled in
-    # setelement_sdp!) past dst's lengths. Base.copyto! on mismatched
-    # vectors throws a raw BoundsError, and dst's counters were just set
-    # to src's — the next append would write past dst's shorter arrays.
-    # Bring dst to src's lengths first (resize! to the same length is a
-    # no-op on the happy path).
-    resize!(dst.row_index, length(src.row_index))
-    resize!(dst.column_index, length(src.column_index))
-    resize!(dst.sp_ele, length(src.sp_ele))
-    copyto!(dst.row_index, src.row_index)
-    copyto!(dst.column_index, src.column_index)
-    # sp_ele must be TOTAL: every slot 1:length(dst.sp_ele) ends up
-    # defined. resize! growth leaves #undef BigFloat slots that mp_set!
-    # cannot even reference, so first (re)define each slot with an
-    # independent zero (plain assignment — the _fill_independent! idiom),
-    # then value-copy the in-use prefix 1:nonZeroEffect. The prefix is
-    # never read beyond nonZeroEffect: src's capacity tail may hold #undef
-    # BigFloat slots, which a full-vector _copyto_independent! would read
-    # (UndefRefError).
-    _fill_independent!(dst.sp_ele, zero(T))
-    _copy_prefix_independent!(dst.sp_ele, src.sp_ele, src.nonZeroEffect)
     return dst
 end
 
@@ -186,20 +192,9 @@ end
 end
 
 function Base.copy(m::SDPASparseMatrix{T}) where {T<:Real}
-    out = SDPASparseMatrix{T}(m.nRow, m.nCol, m.type, m.nonZeroCount)
-    out.nonZeroCount = m.nonZeroCount
-    out.nonZeroEffect = m.nonZeroEffect
-    out.de_ele = _copy_independent(m.de_ele)
-    copyto!(out.row_index, m.row_index)
-    copyto!(out.column_index, m.column_index)
-    # `out`'s constructor zero-initialized its full capacity slots; copy the
-    # in-use prefix into them. Dense matrices carry no sparse value array.
-    if m.type === :sparse
-        _copy_prefix_independent!(out.sp_ele, m.sp_ele, m.nonZeroEffect)
-    else
-        out.sp_ele = _copy_independent(m.sp_ele)
-    end
-    return out
+    # Dense elements start at working precision. Sparse capacity is grown
+    # and initialized once, by the same path as an in-place copy.
+    return copyto!(SDPASparseMatrix{T}(m.nRow, m.nCol, m.type), m)
 end
 
 """
@@ -212,7 +207,7 @@ at `sdpa_struct.cpp:491`.
 
 After conversion: `de_ele` is a `Matrix{T}` of size `(nRow, nCol)`
 (column-major). Index arrays are released. `nonZeroNumber/Count/Effect`
-retain their meaning.
+become the number of dense slots.
 
 If `force=true`, converts regardless of density.
 """
