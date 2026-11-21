@@ -11,8 +11,8 @@ from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
 
-from run import REPO, assess, cpu_set, parameter_text, run_child
-from witness import Invalid, cone_gate, read_problem, read_witness, validate
+from run import REPO, assess, child_environment, cpu_set, parameter_text, run_child
+from witness import Inconclusive, Invalid, MAX_DECIMAL_DIGITS, cone_gate, read_problem, read_witness, validate
 
 
 # Standard-form min <C,Y>, <A,Y>=6 becomes displayed SDPA min b*x,
@@ -75,6 +75,7 @@ exit reason = {reason}
 precision = 256
 threads = 1
 julia = 1.13.0
+active project = /some/Project.toml
 mpfr = 4.2.2
 blas = LBTConfig([ILP64] libopenblas64_.so)
 read_seconds = 0.1
@@ -163,6 +164,24 @@ yMat =
         self.assertFalse(result["dual_symmetric"])
         self.assertFalse(result["accuracy_passed"])
 
+    def test_large_psd_witness_does_not_lose_small_input_scale_shift(self):
+        # Y is genuinely rank one. The input-scale shift is much smaller
+        # than the values in Y, so the candidate needs more than the
+        # baseline guard for 256-bit solver output.
+        data = "1\n1\n2\n0\n1 1 1 1 9\n1 1 1 2 -3\n1 1 2 2 1\n"
+        display = """xVec =
+{0}
+xMat =
+{ {{0,0},{0,0}} }
+yMat =
+{ {{2e100,6e100},{6e100,18e100}} }
+"""
+        p, path = self.files(data=data, result=julia_text(display))
+        w = read_witness(path, p, "julia")
+        self.assertTrue(validate(p, w, D("1e-30"), 126)["accuracy_passed"])
+        with self.assertRaises(Inconclusive):
+            validate(p, w, D("1e-30"), MAX_DECIMAL_DIGITS + 1)
+
     def test_input_digits_beyond_binary64_change_the_verdict(self):
         p, path = self.files(data=MIXED.replace("\n1\n0", "\n1.000000000000000000000000000000000000000000005\n0"),
                              result=julia_text(MIXED_DISPLAY))
@@ -206,6 +225,7 @@ yMat =
                                iteration_cap=3, fixed_iterations=None)
         (self.directory / "stderr.log").write_text("Using dense Schur complement path\n")
         cases = [
+            ("verified", julia_text(iterations=0), None),
             ("solver_status", julia_text(reason="CHOLESKY_FAILURE"), None),
             ("solver_status", julia_text(phase="pdINF"), None),
             ("solver_status", julia_text(phase="pFEAS_dINF"), None),
@@ -236,6 +256,15 @@ yMat =
         self.assertEqual(len(lines), 15)
         self.assertEqual(lines[-4], "%+.95Fe  xPrint")
         self.assertEqual(lines[-1], "%+.95Fe  infPrint")
+
+    def test_cpp_explicit_cpu_places_do_not_bind_julias_initial_thread(self):
+        with patch.dict(os.environ, {"OMP_PLACES": "sockets", "GOMP_CPU_AFFINITY": "1"}):
+            cpp, _ = child_environment([2, 6], "cpp")
+            julia, _ = child_environment([2, 6], "julia")
+            self.assertEqual((cpp["OMP_NUM_THREADS"], cpp["OMP_PLACES"]), ("2", "{2},{6}"))
+            self.assertEqual(julia["OMP_PROC_BIND"], "FALSE")
+            self.assertNotIn("OMP_PLACES", julia)
+            self.assertNotIn("GOMP_CPU_AFFINITY", cpp)
 
 
 @unittest.skipUnless(sys.platform == "linux" and hasattr(os, "pidfd_open") and shutil.which("cc"),

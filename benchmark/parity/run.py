@@ -18,7 +18,7 @@ import subprocess
 import sys
 import time
 
-from witness import Invalid, decimal, read_problem, read_witness, validate
+from witness import Inconclusive, Invalid, MAX_DECIMAL_DIGITS, decimal, read_problem, read_witness, validate
 
 
 HERE = Path(__file__).resolve().parent
@@ -124,7 +124,7 @@ def parameter_text(template, requested_bits, iteration_override, digits):
     return dict(zip(CONTROLS, rows)), rendered
 
 
-def child_environment(threads):
+def child_environment(cpus, solver):
     # Do not inherit experimental Julia routes or OpenMP/BLAS affinity,
     # scheduling, nested pools, or thread counts from the invoking shell.
     prefixes = ("SDPA_", "OMP_", "GOMP_", "KMP_", "MKL_", "OPENBLAS_", "VECLIB_")
@@ -133,11 +133,19 @@ def child_environment(threads):
     env = {key: value for key, value in os.environ.items()
            if not key.startswith(prefixes) and key not in ignored}
     overrides = {
-        "LC_ALL": "C", "LANG": "C", "OMP_NUM_THREADS": str(threads), "OMP_DYNAMIC": "FALSE",
-        "OMP_MAX_ACTIVE_LEVELS": "1", "OMP_PROC_BIND": "TRUE", "OMP_PLACES": "threads",
+        "LC_ALL": "C", "LANG": "C", "OMP_DYNAMIC": "FALSE", "OMP_MAX_ACTIVE_LEVELS": "1",
         "OPENBLAS_NUM_THREADS": "1", "MKL_NUM_THREADS": "1", "BLAS_NUM_THREADS": "1",
         "JULIA_LOAD_PATH": "@:@stdlib",
     }
+    if solver == "cpp":
+        # Explicit CPU places work even when a container hides socket/core
+        # topology from libgomp. Julia uses Julia tasks, not this binding.
+        overrides |= {"OMP_NUM_THREADS": str(len(cpus)), "OMP_PROC_BIND": "close",
+                      "OMP_PLACES": ",".join(f"{{{cpu}}}" for cpu in cpus)}
+    else:
+        # An incidental OpenMP library must not pin Julia's initial thread
+        # to one CPU before Julia starts its own worker pool.
+        overrides |= {"OMP_NUM_THREADS": "1", "OMP_PROC_BIND": "FALSE"}
     return env | overrides, overrides
 
 
@@ -248,7 +256,7 @@ def assess(row, path, problem, args, actual_bits):
             else:
                 row["status"] = "diagnostic_complete"
         elif (
-            witness.phase != "pdOPT" or not 0 < witness.iterations <= args.iteration_cap
+            witness.phase != "pdOPT" or not 0 <= witness.iterations <= args.iteration_cap
             or (solver == "julia" and exit_reason != "OPTIMAL_TERMINAL")
         ):
             row["status"] = "solver_status"
@@ -256,6 +264,8 @@ def assess(row, path, problem, args, actual_bits):
             row["status"] = "accuracy_failed"
         else:
             row["status"] = "verified"
+    except Inconclusive as error:
+        row.update(status="validation_inconclusive", detail=str(error))
     except (DecimalException, OSError, UnicodeError, ValueError) as error:
         row.update(status="invalid_result", detail=str(error))
     finally:
@@ -339,13 +349,13 @@ def campaign(args):
         raise Invalid(f"Julia executable not found: {args.julia}")
     julia = Path(julia_path).resolve()
     cpus = cpu_set(args.cpus, args.threads)
-    env, overrides = child_environment(args.threads)
-    cpp_info = binary_info(cpp, args.cpp_build, args.bits, env)
+    environments = {name: child_environment(cpus, name) for name in ("cpp", "julia")}
+    cpp_info = binary_info(cpp, args.cpp_build, args.bits, environments["cpp"][0])
     cpp_bits = cpp_info["gmp"]["effective_default_bits"]
     actual_bits = args.julia_bits or cpp_bits
     digits = len(str(2 ** max(cpp_bits, actual_bits))) + 16
     args.guard_digits = max(80, digits + 32, -args.target.adjusted() + 40)
-    if args.guard_digits > 10_000:
+    if args.guard_digits > MAX_DECIMAL_DIGITS:
         raise Invalid("accuracy target exceeds the verifier's guard limit")
     controls, params = parameter_text(args.params, args.bits, args.fixed_iterations or args.max_iter, digits)
     args.iteration_cap = int(controls["maxIteration"])
@@ -366,7 +376,16 @@ def campaign(args):
         subprocess.run(measure_command, stdout=log, stderr=subprocess.STDOUT, check=True, timeout=30)
 
     project = args.project.resolve(strict=True)
-    manifests = sorted(project.glob("Manifest*.toml"))
+    captured_project = out / "julia-environment"
+    captured_project.mkdir()
+    project_info = []
+    for path in sorted(project.iterdir()):
+        if path.is_file() and re.fullmatch(r"(?:Julia)?(?:Project|Manifest(?:-v[0-9]+\.[0-9]+)?)\.toml", path.name):
+            capture = captured_project / path.name
+            shutil.copyfile(path, capture)
+            project_info.append(path_info(capture) | {"source_path": str(path)})
+    if not any(Path(item["source_path"]).name in {"Project.toml", "JuliaProject.toml"} for item in project_info):
+        raise Invalid("--project must contain Project.toml or JuliaProject.toml")
     mode = "fixed_iterations" if args.fixed_iterations is not None else "matched_accuracy"
     cpuinfo = optional_text(Path("/proc/cpuinfo"))
     hardware = None if cpuinfo is None else re.search(r"^model name\s*:\s*(.+)$", cpuinfo, re.M)
@@ -384,11 +403,11 @@ def campaign(args):
         "cpp": cpp_info,
         "julia": path_info(julia) | {
             "working_bits": actual_bits, "project": str(project),
-            "project_files": [path_info(p) for p in [project / "Project.toml", *manifests] if p.is_file()],
+            "project_files": project_info,
             "checkout_commit": output(["git", "rev-parse", "HEAD"], cwd=REPO, timeout=10),
             "tracked_worktree_dirty": bool(output(["git", "status", "--porcelain", "--untracked-files=no"],
                                                     cwd=REPO, timeout=10)),
-            "julia_depot_path": env.get("JULIA_DEPOT_PATH"),
+            "julia_depot_path": environments["julia"][0].get("JULIA_DEPOT_PATH"),
         },
         "harness": [path_info(p) for p in (HERE / "run.py", HERE / "witness.py", HERE / "solve_julia.jl", measure_sources)],
         "measurement_monitor": path_info(measure) | {"build_argv": measure_command,
@@ -398,7 +417,8 @@ def campaign(args):
                  "cpu_max": optional_text(Path("/sys/fs/cgroup/cpu.max")),
                  "memory_max": optional_text(Path("/sys/fs/cgroup/memory.max")),
                  "affinity_cpus": cpus},
-        "env_overrides": overrides, "threads": args.threads, "repeats": args.repeat,
+        "env_overrides": {name: overrides for name, (_, overrides) in environments.items()},
+        "threads": args.threads, "repeats": args.repeat,
         "seed": args.seed, "timeout_seconds": args.timeout,
     }
     write_json(out / "manifest.json", manifest)
@@ -422,7 +442,7 @@ def campaign(args):
                                str(actual_bits), str(digits), str(args.threads)]
                 row = {"mode": mode, "solver": solver, "repeat": repeat_id, "argv": command}
                 try:
-                    row.update(run_child(measure, command, directory, env, cpus, args.timeout))
+                    row.update(run_child(measure, command, directory, environments[solver][0], cpus, args.timeout))
                     assess(row, witness, problem, args, actual_bits)
                 except (OSError, ValueError) as error:
                     row.update(status="launch_or_measurement_error", detail=str(error))

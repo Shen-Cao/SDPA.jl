@@ -44,15 +44,21 @@ binary/GMP/OpenMP digests disagree with the run.
 `--project` lets you select a separate instantiated project/manifest, but the
 Julia worker rejects one that resolves SDPA.jl from a different checkout.
 Julia cache/depot setup is outside the timer. Use a new output path per run.
+The report copies the project's conventional Julia project and manifest
+files, including version-specific manifests, into `julia-environment/`
+and records the actually active project per Julia run. Review these files
+before publication: local path dependencies may need the same checkout or
+path remapping on another host.
 For scaling, repeat the same commands at each thread count on an idle host,
 with explicit logical CPU IDs where possible (e.g. `--threads 2 --cpus 2,4`
 if those IDs are from distinct physical cores). Without `--cpus`, the runner
 takes the first N allowed logical CPUs; this is not a topology selection.
 Start within one socket, then separately measure socket/SMT effects. The
-runner assigns the same CPU mask to both children, limits OpenMP to the
-configured pool, resets precision/routing-sensitive environment knobs, and
-pins BLAS and Julia GC worker settings. It does not claim each solver uses
-all requested workers.
+runner assigns the same CPU mask to both children, sets explicit OpenMP
+CPU places on the C++ side, and leaves Julia's own workers free within
+that mask. It resets precision/routing-sensitive environment knobs and
+limits BLAS and Julia GC workers. It does not claim each solver uses all
+requested workers.
 
 The generated `param.sdpa` comes from the first 11 numeric fields of
 `--params` (default: `test/fixtures/param.sdpa`). It is passed explicitly via
@@ -68,7 +74,8 @@ GMP `mpf` precision is a minimum, not an MPFR precision/rounding contract.
 
 * **Matched accuracy (default):** both solvers must return native `pdOPT`,
   with a complete finite witness, and independently pass the specified
-  `--target`. Julia must also report a normal terminal exit. A small
+  `--target`. Julia must also report a normal terminal exit. An initial
+  iterate that already qualifies can be reported at zero iterations. A small
   objective change, process exit zero, or `pdINF` is not success. This
   narrow first harness measures completed runs verified to meet the target,
   not *first iterate* to meet it. Unsupported status/certificates,
@@ -106,6 +113,10 @@ Cholesky candidate uses a half-tolerance diagonal shift, and passes only
 if its exactly recomputed reconstruction error (largest absolute row sum) is
 within the remaining half. Diagonal dominance is also a sufficient
 certificate. LP blocks check each signed entry.
+The candidate guard grows with the magnitude of a block relative to the
+shift; exact-decimal and Cholesky checks are capped at 10,000 working
+digits. Exhausting that cap is reported as inconclusive, never as an
+accepted witness.
 These are conservative numerical witness checks, not exact optimality or
 infeasibility proofs. The offline verifier is cubic in each nontrivial
 PSD block and is intended for bounded benchmark cases, not huge dense

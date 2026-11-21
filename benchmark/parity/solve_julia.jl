@@ -68,6 +68,7 @@ setprecision(BigFloat, bits) do
         println(io, "precision = ", bits)
         println(io, "threads = ", Threads.nthreads())
         println(io, "julia = ", VERSION)
+        println(io, "active project = ", Base.active_project())
         println(io, "mpfr = ", Base.MPFR.version())
         println(io, "blas = ", BLAS.get_config())
         println(io, "read_seconds = ", (t1 - t0) / 1e9)

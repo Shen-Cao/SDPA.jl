@@ -14,11 +14,16 @@ class Invalid(ValueError):
     """An unsupported input or incomplete/malformed solver result."""
 
 
+class Inconclusive(Invalid):
+    """The independent verifier cannot decide within its resource limits."""
+
+
 NUMBER = r"[+-]?(?:[0-9]+(?:\.[0-9]*)?|\.[0-9]+)(?:[eE][+-]?[0-9]+)?"
 INTEGER = r"[+-]?[0-9]+"
 ZERO = D(0)
 ONE = D(1)
 TWO = D(2)
+MAX_DECIMAL_DIGITS = 10_000
 
 
 def decimal(token):
@@ -208,6 +213,7 @@ def read_witness(path, problem, solver):
     elif solver == "julia":
         witness_end = len(text)
         fields |= {"exit reason": r"[A-Z_]+", "threads": r"[0-9]+", "julia": r"[^\r\n]+",
+                   "active project": r"[^\r\n]+",
                    "mpfr": r"[^\r\n]+", "blas": r"[^\r\n]+", "read_seconds": NUMBER,
                    "solve_seconds": NUMBER, "solve_core_seconds": NUMBER}
     else:
@@ -248,8 +254,8 @@ def exact_precision(numbers, degree, terms):
             least = min(least, number.as_tuple().exponent)
             most = max(most, number.adjusted() + 1)
     needed = max(80, degree * (most - least) + len(str(terms)) + 16)
-    if needed > 10_000:
-        raise Invalid("decimal exponent span exceeds the reference verifier's guard limit")
+    if needed > MAX_DECIMAL_DIGITS:
+        raise Inconclusive("decimal exponent span exceeds the reference verifier's guard limit")
     return needed
 
 
@@ -279,6 +285,13 @@ def cone_gate(matrix, tolerance, guard, scale):
 
     # Compute an independent Decimal Cholesky candidate. A successful
     # factor alone is not relied on: verify a reconstruction bound below.
+    # A large rank-deficient block can drown out a fixed input-scale shift
+    # if the candidate precision ignores the magnitude of the block.
+    magnitude = max(abs(value) for row in sym for value in row)
+    if magnitude:
+        guard = max(guard, magnitude.adjusted() - shift.adjusted() + len(str(n)) + 32)
+    if guard > MAX_DECIMAL_DIGITS:
+        raise Inconclusive("shifted Cholesky requires more than the verifier's guard limit")
     lower = []
     with localcontext() as work:
         work.prec = guard
