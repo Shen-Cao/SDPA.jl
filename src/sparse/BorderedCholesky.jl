@@ -157,6 +157,7 @@ function _bordered_packed_cholesky!(
             isfinite(tmp) && tmp > 0 || return false
             mp_set!(values[d], tmp)
         else
+            pivot >= floatmin(Float64) && scale >= floatmin(Float64) || return false
             pivot / scale > guard || return false
             tmp = inv(sqrt(pivot))
             isfinite(tmp) && tmp > 0 || return false
@@ -220,6 +221,27 @@ function _factor_bordered_interior!(F::_BorderedFactors, i::Int)
     return all(isfinite, E)
 end
 
+function _bordered_accumulate_border!(sep::_SchurSkyline{T}, W::Matrix{T}) where {T}
+    vals, off = sep.sp_ele, sep.offsets
+    k = size(W, 2)
+    @inbounds for i in 1:k, j in i:k, r in axes(W, 1)
+        a, b = W[r, i], W[r, j]
+        p = off[i] + (j - i)
+        if T === Float64
+            product = a * b
+            # A normal separator does not make a lost Gram contribution
+            # meaningful. Decline nonzero products outside the normal range.
+            if !iszero(a) && !iszero(b) && abs(product) < floatmin(Float64)
+                return false
+            end
+            vals[p] -= product
+        else
+            _bordered_subtract!(vals, p, a, b)
+        end
+    end
+    return true
+end
+
 function _factor_bordered!(F::_BorderedFactors{T}) where {T}
     F.state === _BORDERED_ASSEMBLED || error("bordered factor requires fresh assembly")
     # Do not allow a failed or interrupted factor to service any RHS.
@@ -242,12 +264,8 @@ function _factor_bordered!(F::_BorderedFactors{T}) where {T}
         end
     end
     # Fixed island/row reduction order, even when interiors ran in parallel.
-    vals, off = sep.sp_ele, sep.offsets
-    k = F.layout.border
     for W in F.panels
-        @inbounds for i in 1:k, j in i:k, r in axes(W, 1)
-            _bordered_subtract!(vals, off[i] + (j - i), W[r, i], W[r, j])
-        end
+        _bordered_accumulate_border!(sep, W) || return false
     end
     _bordered_packed_cholesky!(sep, F.diagonal_scale, F.starts[end], F.pivot_guard) || return false
     F.state = _BORDERED_FACTORED
@@ -288,9 +306,4 @@ function _solve_bordered!(
         _bordered_put!(dst, x[i], perm[i])
     end
     return true
-end
-
-struct _BorderedSchur{T<:Real}
-    factors::_BorderedFactors{T}
-    incidence::_BorderedIncidence
 end

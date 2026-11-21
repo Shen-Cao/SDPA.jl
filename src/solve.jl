@@ -276,9 +276,11 @@ count above `bordered_max_slots` raises `ArgumentError` before materializing
 any Schur matrix. The default cap is 16,000,000 slots; the cap is not a
 total-process memory limit. This strict opt-in ignores legacy ordering
 environment knobs and is incompatible with `force_sparse=true` and with
-specifying a cap without opting in. Numeric rejection returns the last
-accepted point with `CHOLESKY_FAILURE`; there is no legacy fallback on
-mutated factors. Defaults are unchanged.
+specifying a cap without opting in. Predictor and corrector directions
+must pass an independent outward-rounded check against the original
+Schur action. A separate cap bounds verification workspace. Numeric
+rejection returns the last accepted point with `CHOLESKY_FAILURE`;
+there is no legacy fallback. Defaults are unchanged.
 
 ## Precision contract
 - If `T == BigFloat`, the entire solve is wrapped in
@@ -475,6 +477,7 @@ function _solve_inner_locked!(
                 _bordered_refuse("requires nearest rounding for BigFloat")
             problem.nBlock <= _BORDERED_MAX_MODEL_BLOCKS ||
                 _bordered_refuse("model has more than $_BORDERED_MAX_MODEL_BLOCKS cone blocks")
+            _bordered_verify_slots(problem.m, _bordered_verify_dim(problem.blockStruct))
             all(isfinite, problem.b.ele) || _bordered_refuse("non-finite RHS coefficient")
             for j in eachindex(problem.C.SDP_sp_block)
                 isassigned(problem.C.SDP_sp_block, j) || continue
@@ -800,7 +803,7 @@ function _solve_inner_locked!(
         else
             layout = bordered_plan.layout
             newton.bordered = _BorderedSchur(
-                _BorderedFactors{T}(layout), bordered_plan.incidence)
+                _BorderedFactors{T}(layout), bordered_plan.incidence, problem.blockStruct)
             if verbose
                 @info "Using certified bordered Schur complement path" islands=layout.sizes border=layout.border slots=layout.slots
             end

@@ -154,3 +154,30 @@ end
         end
     end
 end
+
+@testset "Float64 Gram range loss cannot certify an arrowhead" begin
+    F = SDPA._BorderedFactors{Float64}(SDPA._bordered_layout([1,2,3,4,0], 20))
+    w = ldexp(1.0, -538)
+    @test iszero(w*w)
+    v = [-w,-w,-w,-w,1.0]
+    for f in (nextfloat(0.0), floatmin(Float64))
+        A = [Matrix{Float64}(I,4,4) fill(w,4); fill(w,1,4) f]
+        b = [0.0,0.0,0.0,0.0,f]
+        setprecision(BigFloat, 512) do
+            H = BigFloat.(A)
+            result = H * BigFloat.(v)
+            if issubnormal(f)
+                @test all(iszero, result)
+                @test norm(result - BigFloat.(b), Inf) / norm(BigFloat.(b), Inf) == 1
+            else
+                @test H[5,5] - sum(abs2,H[1:4,5]) > 0
+            end
+        end
+        _load_bordered_kernel!(F,A)
+        @test !SDPA._factor_bordered!(F)
+        @test F.state === SDPA._BORDERED_FAILED
+    end
+    F = SDPA._BorderedFactors{Float64}(SDPA._bordered_layout([1,2,0],10))
+    _load_bordered_kernel!(F, [1.0 0.0 0.0; 0.0 1.0 0.0; 0.0 0.0 nextfloat(0.0)])
+    @test !SDPA._factor_bordered!(F) # refuses subnormal original/reduced pivot even without couplings
+end

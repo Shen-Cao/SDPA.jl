@@ -70,3 +70,15 @@ end
     @test_throws "expected 2 to 32" SDPA._bordered_layout(collect(1:33),100)
     @test_throws "expected 2 to 32" SDPA._bordered_layout([0,1,1,0],100)
 end
+
+@testset "bordered refuses cancelling mirrored SDP records" begin
+    for T in (Float64, BigFloat)
+        p = _bordered_plan_fixture(T)
+        A = p.A[1]
+        A.SDP_sp_block[2] = SDPA.SDPASparseMatrix{T}(2, 2, :sparse, 2)
+        SDPA.setelement_sdp!(A, 2, 1, 2, one(T))
+        SDPA.setelement_sdp!(A, 2, 2, 1, -one(T))
+        SDPA.initialize_index!(p)
+        @test_throws "duplicate normalized SDP coordinate in row 1" SDPA._certify_bordered(p)
+    end
+end

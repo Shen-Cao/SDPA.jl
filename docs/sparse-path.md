@@ -474,7 +474,9 @@ admit some other partition. Certification scans actual nonzero SDP
 coefficients and each LP scalar, checks the initialized tables and the
 owned row maps, and rejects a cone incidence that connects different
 interiors. There is no numerical threshold for discarding a coefficient
-and no expansion to a quadratic clique graph. The experimental path
+and no expansion to a quadratic clique graph. Sparse coefficient blocks
+with duplicate coordinates (after normalizing mirrored positions) are
+declined rather than guessing their summed support. The experimental path
 requires 2–32 nonempty islands, at most 64 border rows and 64 original
 cone blocks, and Float64 or round-to-nearest BigFloat. It ignores the old
 ordering environment flags and is incompatible with `force_sparse=true`.
@@ -497,9 +499,26 @@ corrector reuse the factor, with no explicit matrix inverse or dense
 retry. An invalid/nonfinite reduced pivot or a pivot within a conservative
 dimension-scaled relative margin of the original diagonal is declined.
 This guard can decline a genuinely positive but numerically unresolved
-pivot and is not a proof of SPD. Numeric failure returns
-`CHOLESKY_FAILURE` at the last accepted iterate. Existing convergence
-tolerances are unchanged; the different elimination order is not
+pivot and is not a proof of SPD. The Float64 route also declines
+subnormal original/reduced diagonal pivots and nonzero Gram products
+that disappear into the subnormal range.
+
+A finite candidate direction is not accepted on the strength of a
+positive factor. For **each** predictor and corrector RHS, an independent
+outward-rounded MPFR check encloses the original Schur action from the
+stored model and iterate: in each SDP cone it forms
+`U = sum(x_i * A_i)`, applies `X * U * Zinv`, and projects back onto the
+constraints; it separately contracts every LP scalar. It never reads a
+rounded factor to validate the result. The entire resulting interval
+must fit within `sqrt(eps(working type)) * norm(rhs, Inf)` of that RHS;
+an exactly zero RHS instead requires an exactly zero direction. This is
+an additional direction acceptance check, not a change to IPM
+convergence tolerances. The check works at `2 * working_bits + 64` bits
+and reuses four largest-cone matrices plus two row endpoint vectors and
+six guard scalars. It adds time for the original action to both RHS
+solves, and can decline otherwise solvable but unresolved directions.
+Numerical failure returns `CHOLESKY_FAILURE` at the last accepted iterate
+without an unbounded retry. The different elimination order is not
 expected to be bit-identical to the legacy factor.
 
 `julia --project=. benchmark/nsps/audit_bordered_shape.jl` audits the

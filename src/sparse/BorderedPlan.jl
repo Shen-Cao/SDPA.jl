@@ -59,9 +59,17 @@ function _bordered_incidence(problem::SDPAProblem)
                 q = M.nonZeroEffect
                 0 <= q <= min(length(M.row_index), length(M.column_index), length(M.sp_ele)) ||
                     _bordered_refuse("invalid sparse SDP storage for block $k in row $i")
+                coords = q > 1 ? Set{Tuple{Int,Int}}() : nothing
                 for l in 1:q
-                    1 <= M.row_index[l] <= n && 1 <= M.column_index[l] <= n ||
+                    r, c = M.row_index[l], M.column_index[l]
+                    1 <= r <= n && 1 <= c <= n ||
                         _bordered_refuse("invalid SDP coordinate in row $i")
+                    if coords !== nothing
+                        pair = minmax(r, c)
+                        pair in coords &&
+                            _bordered_refuse("duplicate normalized SDP coordinate in row $i, block $k")
+                        push!(coords, pair)
+                    end
                     v = M.sp_ele[l]
                     isfinite(v) || _bordered_refuse("non-finite SDP coefficient in row $i")
                     nonzero |= !iszero(v)

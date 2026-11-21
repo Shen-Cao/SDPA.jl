@@ -86,6 +86,7 @@ Mirrors C++ `Newton::compute_DyVec` at `sdpa_newton.cpp:1308-1344`.
 function compute_dyvec!(
     newton_state::NewtonState{T}, is_predictor::Bool
 ) where {T<:Real}
+    newton_state.bordered === nothing || error("bordered direction requires original-action verification")
     if is_predictor
         ok = cholesky_schur!(newton_state)
         if !ok
@@ -93,10 +94,6 @@ function compute_dyvec!(
         end
     end
 
-    bordered = newton_state.bordered
-    if bordered !== nothing
-        return _solve_bordered!(newton_state.DyVec.ele, bordered.factors, newton_state.gvec.ele)
-    end
     if newton_state.use_sparse
         sparse_bmat = newton_state.sparse_bmat
         sparse_bmat === nothing && error("compute_dyvec!: sparse_bmat is nothing")
@@ -141,6 +138,23 @@ function compute_dyvec!(
         copyto!(newton_state.DyVec.ele, newton_state.gvec.ele)
         ldiv!(F, newton_state.DyVec.ele)
     end
+    return true
+end
+
+function _compute_verified_bordered_dyvec!(
+    newton::NewtonState, is_predictor::Bool, problem::SDPAProblem, pt::SDPASolution,
+)
+    schur = newton.bordered
+    schur === nothing && error("bordered Schur path is not initialized")
+    F = schur.factors
+    is_predictor && !_factor_bordered!(F) && return false
+    g, x = newton.gvec.ele, schur.candidate
+    if !_solve_bordered!(x, F, g) ||
+       !_verify_bordered_direction!(schur.verifier, schur.incidence, problem, pt, x, g)
+        F.state = _BORDERED_FAILED
+        return false
+    end
+    _copyto_independent!(newton.DyVec.ele, x)
     return true
 end
 

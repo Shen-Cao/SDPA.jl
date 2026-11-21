@@ -105,10 +105,10 @@ end
             # dyadic off-diagonals to exercise dense and sparse formulas.
             for k in 1:pt.xMat.SDP_nBlock, mat in (pt.xMat,pt.invzMat)
                 D = mat.SDP_block[k].de_ele
-                D[1,2] = D[2,1] = T(1)/T(128)
+                D[1,2] = D[2,1] = (mat === pt.xMat ? -one(T) : one(T))/T(128)
             end
             ns = SDPA.NewtonState{T}(n,p.blockStruct;allocate_dense_bmat=false)
-            ns.bordered = SDPA._BorderedSchur(SDPA._BorderedFactors{T}(plan.layout),plan.incidence)
+            ns.bordered = SDPA._BorderedSchur(SDPA._BorderedFactors{T}(plan.layout),plan.incidence,p.blockStruct)
             SDPA.compute_formula!(ns,p)
             SDPA.make_bmat!(ns,p,pt,work)
             @test ns.bmat === ns.sparse_bmat === nothing
@@ -127,6 +127,11 @@ end
             SDPA.make_bmat!(legacy,p,pt,work)
             out = legacy.sparse_bmat
             @test all(isequal(B[i,j],out.sp_ele[out.offsets[i]+(j-i)]) for i in 1:n for j in i:n)
+            x = T.(mod.(1:n,5).-2)
+            g = B*x
+            @test SDPA._verify_bordered_direction!(ns.bordered.verifier,plan.incidence,p,pt,x,g)
+            g[1] += 100
+            @test !SDPA._verify_bordered_direction!(ns.bordered.verifier,plan.incidence,p,pt,x,g)
         end
     end
 end
