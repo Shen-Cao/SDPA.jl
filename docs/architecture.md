@@ -111,6 +111,8 @@ temporary sorted key buffer. Neither the incidence lists nor the order of
 the formula arithmetic and destination writes change. A block must contain
 at most one active incidence per original constraint; repeated matrix
 triplets are different and still count toward their matrix's weight.
+Hypothetical integer costs such as the block-size cube widen only if they
+would overflow the native integer type. They are not storage limits.
 
 For those distinct IDs, the sparse table keeps its diagonal and exactly
 one orientation of each off-diagonal pair. A checked triangular capacity

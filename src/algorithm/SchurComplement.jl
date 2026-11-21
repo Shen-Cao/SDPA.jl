@@ -561,6 +561,60 @@ function _sdp_formula_prefix!(
     return keys
 end
 
+@inline function _sdp_formula_dimensions(n::I) where {I<:_SchurIndexWidth}
+    n >= 0 || throw(ArgumentError("negative SDP dimension $n"))
+    square, square_overflow = Base.mul_with_overflow(n, n)
+    if !square_overflow
+        cube, cube_overflow = Base.mul_with_overflow(square, n)
+        # The cube is a cost estimate, not a native storage or indexing
+        # limit. Keep the original native type whenever it fits: MPFR's
+        # BigFloat + Int adds the integer directly, even at low precision.
+        cube_overflow || return square, cube
+        return square, Base.checked_mul(widen(square), widen(n))
+    end
+    wide_n = widen(n)
+    wide_square = Base.checked_mul(wide_n, wide_n)
+    return wide_square, Base.checked_mul(wide_square, wide_n)
+end
+
+# Dispatch once per block on the integer cost widths, not once per entry.
+function _select_sdp_formulas!(
+    newton_state::NewtonState{T}, problem::SDPAProblem{T}, l::Int,
+    nconstr_l::Int, kappa::T, n::Int, n²::Integer, n³::Integer,
+) where {T<:Real}
+    up_counts = newton_state._up_counts_scratch
+    # Keep cost arithmetic, tie policy, and writes in the original order.
+    for k1 in 1:nconstr_l
+        i = problem.SDP_constraint[l][k1]
+        ib = problem.SDP_blockIndex[l][k1]
+        Ai_block = problem.A[i].SDP_sp_block[ib]
+        inz = Ai_block.nonZeroEffect
+        up = T(up_counts[i])
+
+        f1 = kappa * n * inz + n³ + kappa * up
+        f2 = kappa * n * inz + kappa * (n + 1) * up
+        f3 = (2 * kappa * inz + 1) * up
+
+        if Ai_block.type === :dense || inz >= n²
+            # Both operands of F3 must be sparse. Ordinarily a dense
+            # block owns every dense/sparse pair because its weight is
+            # the full slot count. A manually assembled sparse block
+            # with repeated triplets may match or exceed that weight.
+            newton_state.useFormula[i, l] = (f1 < f2) ? :F1 : :F2
+        else
+            # SPARSE: min of {f1, f2, f3}.
+            if f1 < f2 && f1 < f3
+                newton_state.useFormula[i, l] = :F1
+            elseif f2 < f3
+                newton_state.useFormula[i, l] = :F2
+            else
+                newton_state.useFormula[i, l] = :F3
+            end
+        end
+    end
+    return nothing
+end
+
 """
     compute_formula!(newton_state, problem, kappa=KAPPA_FORMULA)
 
@@ -600,38 +654,11 @@ function compute_formula!(
         nconstr_l == 0 && continue
 
         keys = _sdp_formula_prefix!(up_counts, keys, problem, l, n, nconstr_l)
-        n² = Base.checked_mul(n, n)
-        n³ = Base.checked_mul(n², n)
-
-        # Keep cost arithmetic, tie policy, and writes in the original order.
-        for k1 in 1:nconstr_l
-            i = problem.SDP_constraint[l][k1]
-            ib = problem.SDP_blockIndex[l][k1]
-            Ai_block = problem.A[i].SDP_sp_block[ib]
-            inz = Ai_block.nonZeroEffect
-            up = T(up_counts[i])
-
-            f1 = kappa * n * inz + n³ + kappa * up
-            f2 = kappa * n * inz + kappa * (n + 1) * up
-            f3 = (2 * kappa * inz + 1) * up
-
-            if Ai_block.type === :dense || inz >= n²
-                # Both operands of F3 must be sparse. Ordinarily a dense
-                # block owns every dense/sparse pair because its weight is
-                # the full slot count. A manually assembled sparse block
-                # with repeated triplets may match or exceed that weight.
-                newton_state.useFormula[i, l] = (f1 < f2) ? :F1 : :F2
-            else
-                # SPARSE: min of {f1, f2, f3}.
-                if f1 < f2 && f1 < f3
-                    newton_state.useFormula[i, l] = :F1
-                elseif f2 < f3
-                    newton_state.useFormula[i, l] = :F2
-                else
-                    newton_state.useFormula[i, l] = :F3
-                end
-            end
-        end
+        n², cube = _sdp_formula_dimensions(n)
+        # A BigInt also has an exact-integer MPFR addition (mpfr_add_z);
+        # a widened machine integer can otherwise be rounded *before* add.
+        n³ = T === BigFloat && !(cube isa Int) ? BigInt(cube) : cube
+        _select_sdp_formulas!(newton_state, problem, l, nconstr_l, kappa, n, n², n³)
     end
     _check_no_F3_on_dense!(problem, newton_state)
     return newton_state

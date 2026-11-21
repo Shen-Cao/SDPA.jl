@@ -155,13 +155,40 @@ end
         p.A[1].SDP_sp_block[1].nonZeroEffect = typemax(Int)
     end
     expect_error(OverflowError) do p
-        # Square still fits, but its cube is not a native-Int cost term.
+        # Not even the cube widened once would fit. No actual storage is
+        # allocated for these deliberately fabricated block dimensions.
+        d = typemax(Int)
+        p.blockStruct[2] = d
+        for a in p.A
+            block = a.SDP_sp_block[1]
+            block.nRow = block.nCol = d
+        end
+    end
+end
+
+@testset "Schur cost widths widen estimates, not the native-fit operands" begin
+    a = Int32(1290)
+    b = Int32(1291)
+    @test SDPA._sdp_formula_dimensions(a) === (a*a, a*a*a)
+    @test SDPA._sdp_formula_dimensions(b) === (b*b, Int64(b)^3)
+    c = Int32(50_000)
+    @test SDPA._sdp_formula_dimensions(c) === (Int64(c)^2, Int64(c)^3)
+    @test_throws OverflowError SDPA._sdp_formula_dimensions(typemax(Int32))
+    @test_throws OverflowError SDPA._sdp_formula_dimensions(typemax(Int64))
+
+    # Exercise the production widened path without allocating invalidly
+    # large numeric matrices: formula selection only reads this metadata.
+    for T in (Float64, BigFloat)
+        p = _schur_planning_fixture(T)
+        ns = SDPA.NewtonState{T}(p.m, p.blockStruct; allocate_dense_bmat=false)
         d = Int(1) << (8 * sizeof(Int) ÷ 3 + 1)
         p.blockStruct[2] = d
         for a in p.A
             block = a.SDP_sp_block[1]
             block.nRow = block.nCol = d
         end
+        @test SDPA.compute_formula!(ns, p; kappa=one(T)) === ns
+        @test all(==(:F3), ns.useFormula[:, 2])
     end
 end
 
