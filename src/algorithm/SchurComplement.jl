@@ -482,6 +482,85 @@ function cal_f3!(
     return s
 end
 
+# Only the counted prefix is active. Some explicit callers retain unused
+# capacity/trailing entries in the lists (including an inactive block).
+function _active_sdp_incidence_count(problem::SDPAProblem, l::Int)
+    n = problem.SDP_nConstraint[l]
+    0 <= n <= min(length(problem.SDP_constraint[l]), length(problem.SDP_blockIndex[l])) ||
+        throw(ArgumentError("invalid active SDP incidence count $n for block $l"))
+    return n
+end
+
+@inline function _checked_sdp_formula_key(problem::SDPAProblem, l::Int, k::Int, n::Int)
+    i = problem.SDP_constraint[l][k]
+    1 <= i <= problem.m ||
+        throw(ArgumentError("invalid SDP constraint ID $i in block $l"))
+    ib = problem.SDP_blockIndex[l][k]
+    Ai = problem.A[i]
+    if !(1 <= ib <= Ai.SDP_sp_nBlock && isassigned(Ai.SDP_sp_block, ib) &&
+         checkbounds(Bool, Ai.SDP_sp_index, ib) && Ai.SDP_sp_index[ib] == l)
+        throw(ArgumentError("invalid SDP block index $ib for constraint $i in block $l"))
+    end
+    block = Ai.SDP_sp_block[ib]
+    (block.nRow == n && block.nCol == n) ||
+        throw(ArgumentError("invalid SDP dimensions for constraint $i in block $l"))
+    weight = block.nonZeroEffect
+    weight >= 0 || throw(ArgumentError("negative SDP weight for constraint $i in block $l"))
+    return (weight, i)
+end
+
+@inline function _add_sdp_formula_prefix!(counts::Vector{Int}, prefix::Int, i::Int, weight::Int, l::Int)
+    counts[i] == -1 || throw(ArgumentError("duplicate SDP constraint ID $i in block $l"))
+    prefix = Base.checked_add(prefix, weight)
+    counts[i] = prefix
+    return prefix
+end
+
+function _sdp_formula_prefix!(
+    counts::Vector{Int}, keys::Union{Nothing,Vector{Tuple{Int,Int}}},
+    problem::SDPAProblem, l::Int, n::Int, active::Int,
+)
+    # Each active ID gets a sentinel before any prefix is written. This
+    # detects duplicate IDs even when their weights differ, without
+    # clearing an m-entry scratch array for each small/disconnected block.
+    ordered = true
+    previous = (-1, 0)
+    for k in 1:active
+        key = _checked_sdp_formula_key(problem, l, k, n)
+        counts[key[2]] = -1
+        ordered &= !isless(key, previous)
+        previous = key
+    end
+
+    # The old scan counted the weights of all *strictly* smaller keys
+    # plus this key's own weight. Keys with unique IDs form a total
+    # order even when weights tie. Do not sort/mutate the incidence lists.
+    cs = problem.SDP_constraint[l]
+    bs = problem.SDP_blockIndex[l]
+    prefix = 0
+    if ordered
+        # Typical equal-weight lists already arrive in constraint-ID order.
+        for k in 1:active
+            i = cs[k]
+            weight = problem.A[i].SDP_sp_block[bs[k]].nonZeroEffect
+            prefix = _add_sdp_formula_prefix!(counts, prefix, i, weight, l)
+        end
+    else
+        scratch = keys === nothing ? Tuple{Int,Int}[] : keys
+        resize!(scratch, active)
+        for k in 1:active
+            i = cs[k]
+            scratch[k] = (problem.A[i].SDP_sp_block[bs[k]].nonZeroEffect, i)
+        end
+        sort!(scratch; alg=Base.Sort.MergeSort)
+        for (weight, i) in scratch
+            prefix = _add_sdp_formula_prefix!(counts, prefix, i, weight, l)
+        end
+        keys = scratch
+    end
+    return keys
+end
+
 """
     compute_formula!(newton_state, problem, kappa=KAPPA_FORMULA)
 
@@ -501,52 +580,42 @@ Selection:
   - If A_i block is DENSE: use F1 if f1 < f2, else F2. NEVER F3.
   - If A_i block is SPARSE: use the min of {f1, f2, f3}, unless its
     triplet count can cause it to own a pair with a dense neighbor.
+
+Each active SDP block-incidence list must have distinct original constraint
+IDs. This is separate from coordinate entries within an individual matrix,
+whose triplet counts are used as stored.
 """
 function compute_formula!(
     newton_state::NewtonState{T}, problem::SDPAProblem{T};
     kappa::T=T(KAPPA_FORMULA),
 ) where {T<:Real}
-    m = problem.m
     fill!(newton_state.useFormula, :F1)
+    up_counts = newton_state._up_counts_scratch
+    keys = nothing
 
     for l in 1:problem.nBlock
-        problem.blockStruct[l] >= 2 || continue
-        nconstr_l = problem.SDP_nConstraint[l]
+        n = problem.blockStruct[l]
+        n >= 2 || continue
+        nconstr_l = _active_sdp_incidence_count(problem, l)
         nconstr_l == 0 && continue
 
-        # Compute upNonZeroCount for each constraint touching block l
-        # (reusing the pre-allocated scratch, one array per call).
-        up_counts = newton_state._up_counts_scratch
-        for k1 in 1:nconstr_l
-            i = problem.SDP_constraint[l][k1]
-            ib = problem.SDP_blockIndex[l][k1]
-            inz = problem.A[i].SDP_sp_block[ib].nonZeroEffect
-            up = inz
-            for k2 in 1:nconstr_l
-                j = problem.SDP_constraint[l][k2]
-                jb = problem.SDP_blockIndex[l][k2]
-                jnz = problem.A[j].SDP_sp_block[jb].nonZeroEffect
-                if jnz < inz || (jnz == inz && j < i)
-                    up += jnz
-                end
-            end
-            up_counts[i] = up
-        end
+        keys = _sdp_formula_prefix!(up_counts, keys, problem, l, n, nconstr_l)
+        n² = Base.checked_mul(n, n)
+        n³ = Base.checked_mul(n², n)
 
-        # Select formula per constraint.
+        # Keep cost arithmetic, tie policy, and writes in the original order.
         for k1 in 1:nconstr_l
             i = problem.SDP_constraint[l][k1]
             ib = problem.SDP_blockIndex[l][k1]
             Ai_block = problem.A[i].SDP_sp_block[ib]
             inz = Ai_block.nonZeroEffect
-            n = Ai_block.nRow
             up = T(up_counts[i])
 
-            f1 = kappa * n * inz + n * n * n + kappa * up
+            f1 = kappa * n * inz + n³ + kappa * up
             f2 = kappa * n * inz + kappa * (n + 1) * up
             f3 = (2 * kappa * inz + 1) * up
 
-            if Ai_block.type === :dense || inz >= n * Ai_block.nCol
+            if Ai_block.type === :dense || inz >= n²
                 # Both operands of F3 must be sparse. Ordinarily a dense
                 # block owns every dense/sparse pair because its weight is
                 # the full slot count. A manually assembled sparse block

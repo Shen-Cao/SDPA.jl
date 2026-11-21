@@ -32,6 +32,7 @@ using GenericLinearAlgebra  # CRITICAL: must be loaded for BigFloat cholesky!/ei
     include("algorithm/test_JordanAlgebra.jl")
     include("algorithm/test_NewtonState.jl")
     include("algorithm/test_SchurComplement.jl")
+    include("algorithm/test_schur_planning.jl")
     include("algorithm/test_bmat_inplace_alloc.jl")
     include("algorithm/test_SchurSolve.jl")
     include("algorithm/test_Mehrotra.jl")
