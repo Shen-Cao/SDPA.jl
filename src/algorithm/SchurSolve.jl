@@ -30,7 +30,8 @@ function cholesky_schur!(newton_state::NewtonState{T}) where {T<:Real}
     if newton_state.use_sparse
         sparse_bmat = newton_state.sparse_bmat
         sparse_bmat === nothing && error("cholesky_schur!: sparse_bmat is nothing but use_sparse=true")
-        ok = sparse_cholesky!(sparse_bmat, newton_state.diagonalIndex)
+        ok = sparse_bmat isa _SchurSkyline ? sparse_cholesky!(sparse_bmat) :
+             sparse_cholesky!(sparse_bmat, newton_state.diagonalIndex)
         # The sparse Cholesky stores the factorisation in-place in
         # sparse_bmat; no separate cache object is needed.
         newton_state.cholesky_factorization = nothing
@@ -116,12 +117,11 @@ function compute_dyvec!(
             end
         end
         permute_vec!(g_perm, newton_state.gvec.ele, newton_state.ordering)
-        solve_systems_sparse!(
-            x_perm,
-            sparse_bmat,
-            g_perm,
-            newton_state.diagonalIndex,
-        )
+        if sparse_bmat isa _SchurSkyline
+            solve_systems_sparse!(x_perm, sparse_bmat, g_perm)
+        else
+            solve_systems_sparse!(x_perm, sparse_bmat, g_perm, newton_state.diagonalIndex)
+        end
         # Un-permute using reverse_ordering (reverse_ordering is READ
         # here, not just written).
         @inbounds for i in eachindex(newton_state.DyVec.ele)

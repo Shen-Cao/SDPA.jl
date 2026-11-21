@@ -136,11 +136,25 @@ sp_ele[diagonalIndex[j] + (i - j)] = B_perm[i, j]   for skyline[j] ≥ i ≥ j
 Each column j stores entries from the diagonal (row j) up to the skyline
 (furthest connected row). Entries outside the skyline are implicitly zero.
 
-**Storage cost**: profile_nnz × sizeof(T) bytes.
+Inside `solve!`, the closed profile owns only its numeric values and
+the `m + 1` offsets. There are no per-entry row or column index arrays.
+This removes two native-word integers per stored value compared with
+the explicit representation; a BigFloat value still owns its precision-
+dependent backing memory. Other costs, such as the SDP location table and
+threaded contribution buffers, are unchanged.
+
+Before allocating values, the solver checks that each column's reach is
+within `j:m`, that reaches are nondecreasing (fill-in closure), and that
+the one-past-the-end offset fits in an `Int`. Numeric assembly still
+rejects any required SDP or LP pair outside its column interval. The
+explicit-coordinate `SDPASparseMatrix`, `profile_from_skyline!`, and the
+factor/solve entry points taking explicit offsets remain available for
+reference and compatibility.
 
 ### Profile-Form Indexing Formula
 
-Verified against C++ `sdpa_newton.cpp:458-485`:
+The checked interval address used by the solver matches
+C++ `sdpa_newton.cpp:458-485`:
 
 ```
 For permuted indices (ii, jj) where ii = min(p_i, p_j), jj = max(p_i, p_j):
