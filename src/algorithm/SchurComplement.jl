@@ -491,7 +491,7 @@ function _active_sdp_incidence_count(problem::SDPAProblem, l::Int)
     return n
 end
 
-@inline function _checked_sdp_formula_key(problem::SDPAProblem, l::Int, k::Int, n::Int)
+@inline function _checked_sdp_incidence_key(problem::SDPAProblem, l::Int, k::Int, n::Int)
     i = problem.SDP_constraint[l][k]
     1 <= i <= problem.m ||
         throw(ArgumentError("invalid SDP constraint ID $i in block $l"))
@@ -526,7 +526,7 @@ function _sdp_formula_prefix!(
     ordered = true
     previous = (-1, 0)
     for k in 1:active
-        key = _checked_sdp_formula_key(problem, l, k, n)
+        key = _checked_sdp_incidence_key(problem, l, k, n)
         counts[key[2]] = -1
         ordered &= !isless(key, previous)
         previous = key
@@ -1640,6 +1640,34 @@ end
     return _binary_search_column(mat, offsets, i, j)
 end
 
+@inline function _checked_sdp_pair_count(n::I) where {I<:_SchurIndexWidth}
+    count = _schur_triangle_slots(n)
+    count <= typemax(I) ||
+        throw(OverflowError("SDP pair count for $n valid incidences does not fit $I"))
+    return I(count)
+end
+
+# The exact triangle identity needs distinct IDs, not just sorted weights.
+# Table construction can be called without running compute_formula! first,
+# and callers may have permuted or edited the active lists since then.
+function _sdp_pair_count!(
+    marks::Vector{Int}, problem::SDPAProblem, l::Int, active::Int,
+)
+    n = problem.blockStruct[l]
+    n >= 2 || throw(ArgumentError("non-SDP block $l has active SDP incidences"))
+    for k in 1:active
+        _, i = _checked_sdp_incidence_key(problem, l, k, n)
+        marks[i] = 0
+    end
+    cs = problem.SDP_constraint[l]
+    for k in 1:active
+        i = cs[k]
+        iszero(marks[i]) || throw(ArgumentError("duplicate SDP constraint ID $i in block $l"))
+        marks[i] = 1
+    end
+    return _checked_sdp_pair_count(active)
+end
+
 """
     make_aggrigate_index_sdp!(newton_state, problem, ordering)
 
@@ -1649,6 +1677,7 @@ Pre-condition: `newton_state.sparse_bmat` contains a closed profile from
 the block-level skyline. With an explicit-coordinate test or compatibility
 matrix, the caller must also set `newton_state.diagonalIndex`. Symbolic
 locations do not depend on the numeric values.
+The counted incidence prefix must contain distinct original constraint IDs.
 
 Post-condition: the 5 location-table arrays are populated; the table
 covers every (i, j, block_l) triple where both i and j have nonzeros in
@@ -1694,29 +1723,14 @@ function make_aggrigate_index_sdp!(
     # pre-sizing avoids the 2×-growth reallocations of `push!`
     # (C++ pre-allocates (n+1)*n/2 per block, sdpa_newton.cpp:415).
     for l in 1:nblocks
-        nC_l = problem.SDP_nConstraint[l]
+        nC_l = _active_sdp_incidence_count(problem, l)
         nC_l == 0 && continue
-        # Exact kept-pair count for this block: pairs (k1,k2) passing the
-        # (inz<jnz) || (inz==jnz && i<j) skip. For uniform nonZeroEffect
-        # this is exactly nC_l*(nC_l+1)/2; computed exactly rather than
-        # assumed.
-        cs_l = problem.SDP_constraint[l]
-        kept = 0
-        for k1 in 1:nC_l
-            i = cs_l[k1]
-            ib = problem.SDP_blockIndex[l][k1]
-            inz = problem.A[i].SDP_sp_block[ib].nonZeroEffect
-            for k2 in 1:nC_l
-                j = cs_l[k2]
-                jb = problem.SDP_blockIndex[l][k2]
-                jnz = problem.A[j].SDP_sp_block[jb].nonZeroEffect
-                (inz < jnz) && continue
-                (inz == jnz && i < j) && continue
-                kept += 1
-            end
-        end
+        # The predicate always keeps the diagonal and exactly one direction
+        # of each off-diagonal pair under the total order (nz, original ID).
+        kept = _sdp_pair_count!(newton_state._up_counts_scratch, problem, l, nC_l)
         n_start = length(newton_state.SDP_constraint1)
-        n_end = n_start + kept
+        n_end = Base.checked_add(n_start, kept)
+        Base.checked_mul(n_end, sizeof(Int))  # byte count of each of the five vectors
         # Exact pre-size (the 5 arrays all grow in lockstep).
         sizehint!(newton_state.SDP_constraint1, n_end)
         sizehint!(newton_state.SDP_constraint2, n_end)
@@ -1724,7 +1738,6 @@ function make_aggrigate_index_sdp!(
         sizehint!(newton_state.blockIndex2, n_end)
         sizehint!(newton_state.SDP_location_sparse_bMat, n_end)
 
-        count_this_block = 0
         for k1 in 1:nC_l
             i = problem.SDP_constraint[l][k1]
             ib = problem.SDP_blockIndex[l][k1]
@@ -1750,10 +1763,10 @@ function make_aggrigate_index_sdp!(
                 push!(newton_state.blockIndex1, ib)
                 push!(newton_state.blockIndex2, jb)
                 push!(newton_state.SDP_location_sparse_bMat, t)
-                count_this_block += 1
             end
         end
-        newton_state.SDP_block_table_len[l] = count_this_block
+        @assert length(newton_state.SDP_constraint1) == n_end
+        newton_state.SDP_block_table_len[l] = kept
     end
 
     return newton_state

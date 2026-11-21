@@ -76,8 +76,8 @@ mutable struct NewtonState{T<:Real}
     # → reverse-permute DyVec. Sized to m once per problem.
     _g_perm_scratch::Vector{T}
     _dy_perm_scratch::Vector{T}
-    # Reusable Int work vector for compute_formula!'s upNonZeroCount
-    # accumulation. Sized to m once per problem.
+    # Reusable Int work vector for compute_formula!'s upNonZeroCount and
+    # sparse table construction's incidence marks. Sized to m once.
     _up_counts_scratch::Vector{Int}
     # Threaded sparse-assembly scratch: per-entry value buffers for
     # threaded_compute_bmat_sparse_sdp! (sized to the location-table

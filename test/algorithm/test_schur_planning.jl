@@ -199,3 +199,86 @@ end
         end
     end
 end
+
+@testset "Sparse Schur table count preserves every emitted record in order" begin
+    for T in (Float64, BigFloat)
+        p = _schur_planning_fixture(T)
+        ns = SDPA.NewtonState{T}(p.m, p.blockStruct; allocate_dense_bmat=false)
+        ns.ordering = vcat(2:2:p.m, 1:2:p.m)
+        ns.reverse_ordering = invperm(ns.ordering)
+        reaches = SDPA.build_skyline_from_problem!(p, ns.ordering, ns.reverse_ordering)
+        ns.sparse_bmat = SDPA._SchurSkyline{T}(reaches)
+        slots = ns.sparse_bmat.offsets
+
+        for reverse_lists in (false, true)
+            if reverse_lists
+                for (cs, bs) in zip(p.SDP_constraint, p.SDP_blockIndex)
+                    reverse!(cs)
+                    reverse!(bs)
+                end
+            end
+            # Not part of the active prefix, and never used as an index.
+            push!(p.SDP_constraint[2], typemax(Int))
+            push!(p.SDP_blockIndex[2], 0)
+            push!(p.SDP_constraint[end], typemax(Int))
+            expected = NTuple{5,Int}[]
+            block_lengths = zeros(Int, p.nBlock)
+            for l in 1:p.nBlock
+                cs, bs = p.SDP_constraint[l], p.SDP_blockIndex[l]
+                for k1 in 1:p.SDP_nConstraint[l], k2 in 1:p.SDP_nConstraint[l]
+                    i, j = cs[k1], cs[k2]
+                    ib, jb = bs[k1], bs[k2]
+                    inz = p.A[i].SDP_sp_block[ib].nonZeroEffect
+                    jnz = p.A[j].SDP_sp_block[jb].nonZeroEffect
+                    if inz < jnz || (inz == jnz && i < j)
+                        continue
+                    end
+                    ii, jj = minmax(ns.reverse_ordering[i], ns.reverse_ordering[j])
+                    push!(expected, (i, j, ib, jb, slots[ii] + jj - ii))
+                    block_lengths[l] += 1
+                end
+            end
+            # No compute_formula! call establishes any hidden marks.
+            @test SDPA.make_aggrigate_index_sdp!(ns, p, ns.ordering) === ns
+            actual = collect(zip(ns.SDP_constraint1, ns.SDP_constraint2, ns.blockIndex1,
+                                 ns.blockIndex2, ns.SDP_location_sparse_bMat))
+            @test actual == expected
+            @test ns.SDP_block_table_len == block_lengths == [0, 136, 3, 6, 3, 0]
+            pop!(p.SDP_constraint[2])
+            pop!(p.SDP_blockIndex[2])
+            pop!(p.SDP_constraint[end])
+        end
+    end
+end
+
+@testset "Sparse Schur count requires valid unique incidences and native capacity" begin
+    function bad_incidence(change)
+        p = _schur_planning_fixture(Float64)
+        ns = SDPA.NewtonState{Float64}(p.m, p.blockStruct; allocate_dense_bmat=false)
+        ns.ordering = collect(1:p.m)
+        ns.reverse_ordering = copy(ns.ordering)
+        ns.sparse_bmat = SDPA._SchurSkyline{Float64}(fill(p.m, p.m))
+        change(p)
+        @test_throws ArgumentError SDPA.make_aggrigate_index_sdp!(ns, p, ns.ordering)
+        @test isempty(ns.SDP_constraint1)   # no records from the invalid first SDP block
+    end
+    bad_incidence() do p
+        p.SDP_constraint[2][2] = p.SDP_constraint[2][1]
+    end
+    bad_incidence() do p
+        p.SDP_constraint[2][2] = 0
+    end
+    bad_incidence() do p
+        p.SDP_blockIndex[2][2] = 2 # belongs to a different original block
+    end
+    bad_incidence() do p
+        p.SDP_nConstraint[2] += 1
+    end
+    @test SDPA._checked_sdp_pair_count(Int32(0)) === Int32(0)
+    @test SDPA._checked_sdp_pair_count(Int32(65_535)) === Int32(2_147_450_880)
+    @test_throws OverflowError SDPA._checked_sdp_pair_count(Int32(65_536))
+    @test_throws ArgumentError SDPA._checked_sdp_pair_count(Int32(-1))
+    n64 = Int64(4_294_967_295)
+    @test SDPA._checked_sdp_pair_count(n64) == big(n64) * (big(n64) + 1) ÷ 2
+    @test_throws OverflowError SDPA._checked_sdp_pair_count(n64 + 1)
+end
