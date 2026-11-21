@@ -26,3 +26,15 @@ using Test
     @test isapprox(X_val, X_val', atol=1e-5)       # symmetric
     @test (X_val[1,1] + X_val[2,2]) ≈ 1.0 atol=1e-5  # constraint satisfied
 end
+
+@testset "JuMP distinguishes bridged conic duals from shadow prices" begin
+    model = Model(() -> SDPA.Optimizer{Float64}(silent=true))
+    @variable(model, x[1:1] in MathOptInterface.Nonnegatives(1))
+    upper = @constraint(model, 2x[1] <= 4)
+    @objective(model, Max, 2x[1] + 1)
+    optimize!(model)
+    @test termination_status(model) == MathOptInterface.OPTIMAL
+    @test objective_value(model) ≈ 5 atol=1e-6
+    @test dual(upper) ≈ -1 atol=1e-6
+    @test shadow_price(upper) ≈ 1 atol=1e-6
+end

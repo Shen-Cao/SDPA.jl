@@ -483,58 +483,87 @@ end
     end
 end
 
-@testset "ConstraintDual sign under MAX_SENSE" begin
-    # MOI's dual convention is ∂V/∂b for the problem AS STATED. For
-    # MAX_SENSE the solver internally minimizes ⟨-C,X⟩, so its raw duals
-    # are negated; the accessors must flip the sign (the same negation
-    # DualObjectiveValue applies).
+@testset "MOI conic duals for min f and max -f" begin
+    for T in (Float64, BigFloat), sense in (MOI.MIN_SENSE, MOI.MAX_SENSE)
+        sign = sense == MOI.MIN_SENSE ? one(T) : -one(T)
+        # Float64 uses 1e-7 solver tolerances; BigFloat uses 1e-30.
+        tol = T === Float64 ? T(1e-6) : T(1e-24)
 
-    @testset "equality dual, max 2x s.t. x == 5 (expect +2)" begin
-        src = MOI.Utilities.Model{Float64}()
-        x, _ = MOI.add_constrained_variables(src, MOI.Nonnegatives(1))
-        ci = MOI.add_constraint(src, MOI.ScalarAffineFunction(
-            MOI.ScalarAffineTerm.([1.0], [x[1]]), 0.0), MOI.EqualTo(5.0))
-        MOI.set(src, MOI.ObjectiveSense(), MOI.MAX_SENSE)
-        MOI.set(src, MOI.ObjectiveFunction{MOI.ScalarAffineFunction{Float64}}(),
-            MOI.ScalarAffineFunction(MOI.ScalarAffineTerm.([2.0], [x[1]]), 0.0))
-        opt = SDPA.Optimizer{Float64}(silent=true)
-        MOI.optimize!(opt, src)
-        @test MOI.get(opt, MOI.TerminationStatus()) == MOI.OPTIMAL
-        @test MOI.get(opt, MOI.ConstraintDual(), ci) ≈ 2.0 atol=1e-6
-    end
+        @testset "same objective, different senses ($T, $sense)" begin
+            # Keep the objective +2x (do not negate it between senses).
+            # For x=5>0 the cone slack is zero; the equality dual is
+            # +2 at minimization and -2 at maximization.
+            src = MOI.Utilities.Model{T}()
+            x, _ = MOI.add_constrained_variables(src, MOI.Nonnegatives(1))
+            eq = MOI.add_constraint(src,
+                MOI.ScalarAffineFunction([MOI.ScalarAffineTerm(one(T), x[1])], zero(T)),
+                MOI.EqualTo(T(5)))
+            MOI.set(src, MOI.ObjectiveSense(), sense)
+            MOI.set(src, MOI.ObjectiveFunction{MOI.ScalarAffineFunction{T}}(),
+                MOI.ScalarAffineFunction([MOI.ScalarAffineTerm(T(2), x[1])], zero(T)))
+            opt = SDPA.Optimizer{T}(silent=true)
+            MOI.optimize!(opt, src)
+            @test MOI.get(opt, MOI.TerminationStatus()) == MOI.OPTIMAL
+            @test MOI.get(opt, MOI.ConstraintDual(), eq) ≈ sign * 2 atol=tol
+        end
 
-    @testset "equality dual, min 2x s.t. x == 5 (unchanged, +2)" begin
-        src = MOI.Utilities.Model{Float64}()
-        x, _ = MOI.add_constrained_variables(src, MOI.Nonnegatives(1))
-        ci = MOI.add_constraint(src, MOI.ScalarAffineFunction(
-            MOI.ScalarAffineTerm.([1.0], [x[1]]), 0.0), MOI.EqualTo(5.0))
-        MOI.set(src, MOI.ObjectiveSense(), MOI.MIN_SENSE)
-        MOI.set(src, MOI.ObjectiveFunction{MOI.ScalarAffineFunction{Float64}}(),
-            MOI.ScalarAffineFunction(MOI.ScalarAffineTerm.([2.0], [x[1]]), 0.0))
-        opt = SDPA.Optimizer{Float64}(silent=true)
-        MOI.optimize!(opt, src)
-        @test MOI.get(opt, MOI.TerminationStatus()) == MOI.OPTIMAL
-        @test MOI.get(opt, MOI.ConstraintDual(), ci) ≈ 2.0 atol=1e-6
-    end
+        @testset "LP and equality ($T, $sense)" begin
+            # min 2x + y (or max its negative), x + y = 5, x,y >= 0.
+            # Both forms have the MOI equality dual 1 and cone dual [1,0].
+            src = MOI.Utilities.Model{T}()
+            v, lp_ci = MOI.add_constrained_variables(src, MOI.Nonnegatives(2))
+            c = T[2, 1]
+            eq = MOI.add_constraint(src,
+                MOI.ScalarAffineFunction(MOI.ScalarAffineTerm.(ones(T, 2), v), zero(T)),
+                MOI.EqualTo(T(5)))
+            MOI.set(src, MOI.ObjectiveSense(), sense)
+            MOI.set(src, MOI.ObjectiveFunction{MOI.ScalarAffineFunction{T}}(),
+                MOI.ScalarAffineFunction(MOI.ScalarAffineTerm.(sign .* c, v), zero(T)))
+            opt = SDPA.Optimizer{T}(silent=true)
+            MOI.optimize!(opt, src)
+            @test MOI.get(opt, MOI.TerminationStatus()) == MOI.OPTIMAL
+            x = MOI.get(opt, MOI.ConstraintPrimal(), lp_ci)
+            z = MOI.get(opt, MOI.ConstraintDual(), lp_ci)
+            y = MOI.get(opt, MOI.ConstraintDual(), eq)
+            @test sum(x) ≈ 5 atol=tol
+            @test x ≈ T[0, 5] atol=tol
+            @test y ≈ 1 atol=tol
+            @test minimum(z) >= -tol
+            @test c ≈ y .+ z atol=tol       # stationarity in minimization form
+            @test abs(sum(x .* z)) <= tol  # complementarity
+            @test MOI.get(opt, MOI.ObjectiveValue()) ≈ sign * 5 atol=tol
+            @test MOI.get(opt, MOI.DualObjectiveValue()) ≈ sign * 5 atol=tol
+        end
 
-    @testset "equality + LP-cone duals, max -2x - y s.t. x + y == 5" begin
-        # Optimum at x=0, y=5 (obj -5). For the problem as stated:
-        #   ∂V/∂b = -1  (equality dual)
-        #   cone dual z̄ = [-1, 0]  (negated min-form Z = [1, 0])
-        src = MOI.Utilities.Model{Float64}()
-        x, lp_ci = MOI.add_constrained_variables(src, MOI.Nonnegatives(2))
-        eq_ci = MOI.add_constraint(src, MOI.ScalarAffineFunction(
-            MOI.ScalarAffineTerm.([1.0, 1.0], x), 0.0), MOI.EqualTo(5.0))
-        MOI.set(src, MOI.ObjectiveSense(), MOI.MAX_SENSE)
-        MOI.set(src, MOI.ObjectiveFunction{MOI.ScalarAffineFunction{Float64}}(),
-            MOI.ScalarAffineFunction(MOI.ScalarAffineTerm.([-2.0, -1.0], x), 0.0))
-        opt = SDPA.Optimizer{Float64}(silent=true)
-        MOI.optimize!(opt, src)
-        @test MOI.get(opt, MOI.TerminationStatus()) == MOI.OPTIMAL
-        @test MOI.get(opt, MOI.ObjectiveValue()) ≈ -5.0 atol=1e-6
-        @test MOI.get(opt, MOI.ConstraintDual(), eq_ci) ≈ -1.0 atol=1e-6
-        cone_dual = MOI.get(opt, MOI.ConstraintDual(), lp_ci)
-        @test cone_dual[1] ≈ -1.0 atol=1e-6
-        @test cone_dual[2] ≈ 0.0 atol=1e-6
+        @testset "PSD triangle and equality ($T, $sense)" begin
+            # C = [2 1; 1 2], tr(X) = 1. The optimal duals are y=1,
+            # Z=C-I=[1 1; 1 1]. Nonzero off-diagonals exercise the
+            # triangle scalar product as well as the sign of the dual.
+            src = MOI.Utilities.Model{T}()
+            v, psd_ci = MOI.add_constrained_variables(
+                src, MOI.PositiveSemidefiniteConeTriangle(2))
+            eq = MOI.add_constraint(src,
+                MOI.ScalarAffineFunction(
+                    MOI.ScalarAffineTerm.(ones(T, 2), v[[1, 3]]), zero(T)),
+                MOI.EqualTo(one(T)))
+            MOI.set(src, MOI.ObjectiveSense(), sense)
+            MOI.set(src, MOI.ObjectiveFunction{MOI.ScalarAffineFunction{T}}(),
+                MOI.ScalarAffineFunction(MOI.ScalarAffineTerm.(fill(2 * sign, 3), v),
+                                         4 * sign))
+            opt = SDPA.Optimizer{T}(silent=true)
+            MOI.optimize!(opt, src)
+            @test MOI.get(opt, MOI.TerminationStatus()) == MOI.OPTIMAL
+            x11, x12, x22 = MOI.get(opt, MOI.ConstraintPrimal(), psd_ci)
+            z11, z12, z22 = MOI.get(opt, MOI.ConstraintDual(), psd_ci)
+            y = MOI.get(opt, MOI.ConstraintDual(), eq)
+            @test x11 + x22 ≈ 1 atol=tol
+            @test y ≈ 1 atol=tol
+            @test T[y + z11, z12, y + z22] ≈ T[2, 1, 2] atol=tol
+            @test min(z11, z22) >= -tol
+            @test z11 * z22 - z12^2 >= -tol
+            @test abs(x11*z11 + 2*x12*z12 + x22*z22) <= tol
+            @test MOI.get(opt, MOI.ObjectiveValue()) ≈ sign * 5 atol=tol
+            @test MOI.get(opt, MOI.DualObjectiveValue()) ≈ sign * 5 atol=tol
+        end
     end
 end
