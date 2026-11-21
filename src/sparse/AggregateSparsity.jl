@@ -13,7 +13,8 @@ This module:
 2. Decides whether to use sparse or dense Schur complement
 3. Computes a fill-reducing ordering via AMD
 
-Decision rule:
+A single LP block with disjoint nonempty row supports can use an
+exact diagonal Schur profile. Otherwise, the decision is:
   - if m < 100: dense
   - if nBlock < 5: dense
   - if aggregate_density > 0.25: dense
@@ -186,6 +187,30 @@ function compute_amd_ordering(adj::SparseMatrixCSC{Bool,Int})
     return AMD.amd(pattern)
 end
 
+# The LP Schur complement is A * diag(x ./ z) * A'. Each scalar
+# contributes an outer product of one column of A. If every nonempty row
+# uses only scalars that no other row uses, Schur B is diagonal in every
+# iteration. Require all rows to be nonempty so structural singularity
+# continues through the ordinary routing and failure path.
+function _has_diagonal_lp_schur(problem::SDPAProblem)
+    problem.nBlock == 1 && problem.blockStruct[1] < 0 || return false
+    problem.m <= lp_scalar_count(problem.blockStruct) || return false
+    seen = Set{Int}()
+    for Ai in problem.A
+        Ai.LP_nnz > 0 || return false
+        for k in 1:Ai.LP_nnz
+            v = Ai.LP_sp_val[k]
+            # Assembly uses stored incidences. Decline noncanonical
+            # explicit zeros rather than disagreeing with that graph.
+            isfinite(v) && !iszero(v) || return false
+            scalar = Ai.LP_sp_index[k]
+            scalar in seen && return false
+            push!(seen, scalar)
+        end
+    end
+    return true
+end
+
 """
     analyze_sparsity(problem; method=:metis) -> (use_dense::Bool, ordering::Vector{Int}, adj)
 
@@ -202,6 +227,12 @@ function analyze_sparsity(
 ) where {T<:Real}
     m = problem.m
     nBlock = problem.nBlock
+    # Retain the small-problem cutoff, but avoid a dense factor for a
+    # provably diagonal, structurally nonsingular single LP block.
+    if m >= 100 && _has_diagonal_lp_schur(problem)
+        return false, collect(1:m), spdiagm(0 => trues(m))
+    end
+
     # Early gate: when the m/nBlock pre-rules already route dense, the
     # position-level graph is dead work — its density can never change the
     # decision (mirror C++ sdpa_chordal.cpp:349 `m <= 100 || nBlock <= 5`).
@@ -306,70 +337,30 @@ function build_skyline_from_problem!(
     m = problem.m
     skyline = collect(1:m)  # diagonal at minimum
 
-    # Iterate each SDP block; for each pair (k1, k2) of constraints
-    # touching that block, extend the skyline.
-    for l in 1:length(problem.SDP_nConstraint)
-        nC_l = problem.SDP_nConstraint[l]
-        nC_l <= 1 && continue
-        constrs = problem.SDP_constraint[l]
-        for k1 in 1:nC_l
-            i = constrs[k1]
-            p_i = reverse_ordering[i]
-            for k2 in (k1+1):nC_l
-                j = constrs[k2]
-                p_j = reverse_ordering[j]
-                ii = min(p_i, p_j)
-                jj = max(p_i, p_j)
-                if jj > skyline[ii]
-                    skyline[ii] = jj
-                end
+    # Each SDP block or LP scalar induces a clique on its constraints.
+    # For any member, the only edge that matters to the envelope is its
+    # edge to the largest permuted index. Walk the incidence lists twice,
+    # instead of enumerating all pairs in each clique.
+    for constraint_lists in (problem.SDP_constraint, problem.LP_constraint)
+        for constraints in constraint_lists
+            length(constraints) <= 1 && continue
+            hi = 0
+            for i in constraints
+                hi = max(hi, reverse_ordering[i])
+            end
+            for i in constraints
+                j = reverse_ordering[i]
+                skyline[j] = max(skyline[j], hi)
             end
         end
     end
 
-    # Iterate each LP scalar position; same connectivity (C++
-    # makeGraph's LP merge, sdpa_chordal.cpp:204-211). The LP tables are
-    # sized per LP scalar (SDPAProblem.jl) and contain only constraints
-    # with a nonzero LP value in `LP_constraint[l]` — exactly
-    # the pairs `_compute_bmat_sparse_lp!` emits.
-    for l in 1:length(problem.LP_nConstraint)
-        nC_l = problem.LP_nConstraint[l]
-        nC_l <= 1 && continue
-        constrs = problem.LP_constraint[l]
-        for k1 in 1:nC_l
-            i = constrs[k1]
-            p_i = reverse_ordering[i]
-            for k2 in (k1+1):nC_l
-                j = constrs[k2]
-                p_j = reverse_ordering[j]
-                ii = min(p_i, p_j)
-                jj = max(p_i, p_j)
-                if jj > skyline[ii]
-                    skyline[ii] = jj
-                end
-            end
-        end
-    end
-
-    # Fill-in closure (C++ `Chordal`/symbfac semantics, sdpa_newton.cpp:
-    # 225-340): the skyline must contain every position the Cholesky
-    # factor needs, not just the original B connectivity.  If column i's
-    # envelope reaches row j (i < j ≤ skyline[i]), the elimination of i
-    # emits updates to column j that touch every row ≤ skyline[i], so
-    # column j's envelope must reach at least skyline[i] — otherwise the
-    # profile-form Cholesky silently drops genuine fill-in and produces
-    # an inexact factor.
-    #
-    # This is the symbolic-factorization envelope of the ordered graph,
-    # computed to a fixed point (processing columns in increasing order
-    # makes each `skyline[i]` final before it is used as a source).
-    @inbounds for i in 1:m
-        hi = skyline[i]
-        for j in (i + 1):hi
-            if skyline[j] < hi
-                skyline[j] = hi
-            end
-        end
+    # Column j-1's closed reach is the maximum of the preceding reaches.
+    # If that reach is at least j, its update must extend column j to that
+    # row as well. Otherwise it cannot change skyline[j], which is >= j.
+    # Thus the exact fill-closed envelope is one inclusive prefix maximum.
+    @inbounds for j in 2:m
+        skyline[j] = max(skyline[j], skyline[j - 1])
     end
 
     return skyline
