@@ -27,6 +27,10 @@ definite (triggers main-loop break in the caller).
 Mirrors C++ `Lal::choleskyFactorWithAdjust` at `sdpa_linear.cpp:608-681`.
 """
 function cholesky_schur!(newton_state::NewtonState{T}) where {T<:Real}
+    bordered = newton_state.bordered
+    if bordered !== nothing
+        return _factor_bordered!(bordered.factors)
+    end
     if newton_state.use_sparse
         sparse_bmat = newton_state.sparse_bmat
         sparse_bmat === nothing && error("cholesky_schur!: sparse_bmat is nothing but use_sparse=true")
@@ -89,6 +93,10 @@ function compute_dyvec!(
         end
     end
 
+    bordered = newton_state.bordered
+    if bordered !== nothing
+        return _solve_bordered!(newton_state.DyVec.ele, bordered.factors, newton_state.gvec.ele)
+    end
     if newton_state.use_sparse
         sparse_bmat = newton_state.sparse_bmat
         sparse_bmat === nothing && error("compute_dyvec!: sparse_bmat is nothing")

@@ -2,6 +2,7 @@
 # verifies every coefficient incidence without forming the clique graph.
 const _BORDERED_MAX_BORDER = 64
 const _BORDERED_MAX_ISLANDS = 32
+const _BORDERED_MAX_MODEL_BLOCKS = 64
 const _BORDERED_DEFAULT_MAX_SLOTS = 16_000_000
 
 struct _BorderedSDPEntry
@@ -46,8 +47,10 @@ function _bordered_incidence(problem::SDPAProblem)
                 _bordered_refuse("invalid SDP dimensions for block $k in row $i")
             nonzero = false
             if M.type === :dense
-                size(M.de_ele) == (n, n) ||
+                size(M.de_ele) == (n, n) && M.nonZeroEffect == length(M.de_ele) ||
                     _bordered_refuse("invalid dense SDP storage for block $k in row $i")
+                issymmetric(M.de_ele) ||
+                    _bordered_refuse("nonsymmetric dense SDP coefficients in row $i")
                 for v in M.de_ele
                     isfinite(v) || _bordered_refuse("non-finite SDP coefficient in row $i")
                     nonzero |= !iszero(v)

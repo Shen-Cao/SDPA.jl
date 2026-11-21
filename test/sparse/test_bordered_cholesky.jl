@@ -46,7 +46,11 @@ end
             @test layout.slots == sum(D -> length(D.sp_ele), F.interiors) +
                     sum(length, F.panels) + length(F.separator.sp_ele)
             @test_throws "requires valid factors" SDPA._solve_bordered!(zeros(T,n), F, zeros(T,n))
+            slot = F.interiors[1].sp_ele[1]
             _load_bordered_kernel!(F, A)
+            if T === BigFloat
+                @test F.interiors[1].sp_ele[1] === slot
+            end
             @test SDPA._factor_bordered!(F)
             snapshot = SDPA._copy_independent(vcat(F.separator.sp_ele,
                         [D.sp_ele for D in F.interiors]..., vec.(F.panels)...))

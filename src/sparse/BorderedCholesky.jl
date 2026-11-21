@@ -23,7 +23,12 @@ end
 function _BorderedFactors{T}(layout::_BorderedLayout) where {T<:Union{Float64,BigFloat}}
     m = length(layout.order)
     k = layout.border
-    starts = cumsum([1; layout.sizes]) # last entry starts the border
+    starts = Vector{Int}(undef, length(layout.sizes) + 1)
+    starts[1] = 1
+    for (i, n) in enumerate(layout.sizes)
+        starts[i + 1] = Base.checked_add(starts[i], n)
+    end
+    # The sentinel is also the first permuted position of the border.
     return _BorderedFactors{T}(
         layout, [_SchurSkyline{T}(fill(n, n)) for n in layout.sizes],
         [_independent_zeros(T, n, k) for n in layout.sizes],
@@ -33,15 +38,29 @@ function _BorderedFactors{T}(layout::_BorderedLayout) where {T<:Union{Float64,Bi
     )
 end
 
+function _zero_bordered_values!(values::AbstractArray{BigFloat})
+    # The constructor gave each slot independent storage. Reuse it rather
+    # than allocate an entire new numerical factor on every assembly.
+    for x in values
+        mp_zero!(x)
+    end
+    return nothing
+end
+
+function _zero_bordered_values!(values::AbstractArray{T}) where {T}
+    fill!(values, zero(T))
+    return nothing
+end
+
 function _reset_bordered!(F::_BorderedFactors)
     F.state = _BORDERED_EMPTY
     for D in F.interiors
-        _fill_independent!(D.sp_ele, zero(eltype(D.sp_ele)))
+        _zero_bordered_values!(D.sp_ele)
     end
     for E in F.panels
-        _fill_independent!(E, zero(eltype(E)))
+        _zero_bordered_values!(E)
     end
-    _fill_independent!(F.separator.sp_ele, zero(eltype(F.separator.sp_ele)))
+    _zero_bordered_values!(F.separator.sp_ele)
     return nothing
 end
 
@@ -269,4 +288,9 @@ function _solve_bordered!(
         _bordered_put!(dst, x[i], perm[i])
     end
     return true
+end
+
+struct _BorderedSchur{T<:Real}
+    factors::_BorderedFactors{T}
+    incidence::_BorderedIncidence
 end

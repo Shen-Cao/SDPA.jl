@@ -455,3 +455,53 @@ diverges — the block-level profile is mandatory.
 - Julia implementation: `src/sparse/AggregateSparsity.jl`,
   `src/sparse/SparseCholesky.jl`
 - Measured campaigns: `benchmark/nsps/README.md`
+
+## Experimental bounded bordered-direct Schur solver
+
+The default routing is unchanged. To require a separately certified
+bordered backend, pass `bordered_schur=true` to `solve!`. This is a
+strict opt-in, not an automatically selected fallback. For example:
+
+```julia
+log = SDPA.solve!(problem, params; bordered_schur=true,
+                  bordered_max_slots=2_000_000)
+```
+
+Rows with exactly one nonzero SDP-block incidence seed islands; rows
+with none or more than one are potential border rows. This candidate rule
+is intentionally restricted, so it can decline a problem that could
+admit some other partition. Certification scans actual nonzero SDP
+coefficients and each LP scalar, checks the initialized tables and the
+owned row maps, and rejects a cone incidence that connects different
+interiors. There is no numerical threshold for discarding a coefficient
+and no expansion to a quadratic clique graph. The experimental path
+requires 2–32 nonempty islands, at most 64 border rows and 64 original
+cone blocks, and Float64 or round-to-nearest BigFloat. It ignores the old
+ordering environment flags and is incompatible with `force_sparse=true`.
+
+For interior sizes `n_i` and border size `k`, the factor/panel cap
+(default 16,000,000 numeric slots) counts
+`sum(n_i*(n_i+1)/2 + n_i*k) + k*(k+1)/2`. It does not count model data,
+linear scratch and incumbent solver workspaces, runtime overhead, or
+whole-process RSS. The border is allowed to be dense. A refused
+certificate or slot cap raises `ArgumentError` before any numerical
+Schur allocation. The route streams original SDP and LP contributions
+into their packed destinations; it does not allocate a legacy skyline,
+dense Schur matrix, location table, or per-pair contribution buffer.
+
+The solver factors each interior once per predictor, overwrites its
+coupling panel with a triangular solve, and factors the reduced border.
+Independent sufficiently large interior work can run in parallel without
+nested factor tasks; border reduction order is fixed. The predictor and
+corrector reuse the factor, with no explicit matrix inverse or dense
+retry. An invalid/nonfinite reduced pivot or a pivot within a conservative
+dimension-scaled relative margin of the original diagonal is declined.
+This guard can decline a genuinely positive but numerically unresolved
+pivot and is not a proof of SPD. Numeric failure returns
+`CHOLESKY_FAILURE` at the last accepted iterate. Existing convergence
+tolerances are unchanged; the different elimination order is not
+expected to be bit-identical to the legacy factor.
+
+`julia --project=. benchmark/nsps/audit_bordered_shape.jl` audits the
+bundled NSPS layouts without assembling or solving them. The projected
+factor/panel slots are not a measured NSPS memory footprint or speedup.
