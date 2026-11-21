@@ -145,7 +145,10 @@ threaded contribution buffers, are unchanged.
 
 Before allocating values, the solver checks that each column's reach is
 within `j:m`, that reaches are nondecreasing (fill-in closure), and that
-the one-past-the-end offset fits in an `Int`. Numeric assembly still
+the one-past-the-end offset fits in an `Int`. Routing counts hypothetical
+slots in a widened integer and compares the density thresholds exactly;
+it does not allocate offsets or values for an envelope it will reject.
+Numeric assembly still
 rejects any required SDP or LP pair outside its column interval. The
 explicit-coordinate `SDPASparseMatrix`, `profile_from_skyline!`, and the
 factor/solve entry points taking explicit offsets remain available for

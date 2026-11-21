@@ -655,8 +655,9 @@ function _solve_inner_locked!(
                     pos_skyline = SDPA.build_skyline_from_problem!(
                         problem, ordering, reverse_ordering)
                     full_nnz = _schur_triangle_slots(problem.m)
-                    pos_density = _skyline_slots(_ClosedSkyline(pos_skyline)) / full_nnz
-                    if pos_density > 0.4
+                    pos_slots = _schur_route_slots(pos_skyline)
+                    pos_density = pos_slots / full_nnz
+                    if _schur_density_exceeds(pos_slots, full_nnz, 2, 5)
                         ordering = _block_level_ordering(problem)
                         if verbose
                             @info "ordering routing: block (position-level " *
@@ -700,15 +701,14 @@ function _solve_inner_locked!(
             # all positions within a block via X, Z⁻¹.
             block_skyline = SDPA.build_skyline_from_problem!(
                 problem, ordering, newton.reverse_ordering)
-            shape = _ClosedSkyline(block_skyline)
             full_nnz = _schur_triangle_slots(problem.m)
-            block_profile_nnz = _skyline_slots(shape)
+            block_profile_nnz = _schur_route_slots(block_skyline)
             block_density = block_profile_nnz / full_nnz
             if verbose
                 @info "Block-level skyline: $block_profile_nnz entries " *
                       "(density=$(round(block_density*100; digits=2))%)"
             end
-            if block_density > 0.25
+            if _schur_density_exceeds(block_profile_nnz, full_nnz, 1, 4)
                 if verbose
                     @info "Block-level density >25% — using dense path " *
                           "(F1/F2/F3 couple all constraints within blocks)"
@@ -720,7 +720,7 @@ function _solve_inner_locked!(
                 # against the C++ forced-sparse build. Not a documented user
                 # feature; dense remains the default.
                 if get(ENV, "SDPA_FORCE_SPARSE_PROFILE", "") == "1"
-                    newton.sparse_bmat = _SchurSkyline{T}(shape)
+                    newton.sparse_bmat = _SchurSkyline{T}(block_skyline)
                     make_aggrigate_index_sdp!(newton, problem, ordering)
                     if verbose
                         @info "FORCED sparse profile (SDPA_FORCE_SPARSE_PROFILE=1): " *
@@ -744,7 +744,7 @@ function _solve_inner_locked!(
                           "(density=$(round(block_density*100; digits=2))%)"
                 end
                 # Allocate sparse profile + location table.
-                newton.sparse_bmat = _SchurSkyline{T}(shape)
+                newton.sparse_bmat = _SchurSkyline{T}(block_skyline)
                 make_aggrigate_index_sdp!(newton, problem, ordering)
             end
         else

@@ -25,22 +25,53 @@ struct _ClosedSkyline
     end
 end
 
-@inline function _checked_skyline_end(start::Int, n::Int, i::Int, r::Int, previous::Int)
+# Signed width is parameterized so overflow boundaries can also be tested
+# for 32-bit offsets on a 64-bit host.
+const _SchurIndexWidth = Union{Int32,Int64}
+
+@inline function _checked_skyline_width(n::I, i::I, r::I, previous::I) where {I<:_SchurIndexWidth}
     i <= r <= n || throw(ArgumentError("skyline reach for column $i must be in $i:$n, got $r"))
     previous <= r || throw(ArgumentError(
         "skyline is not fill-in closed: reach $r in column $i is below $previous"))
-    # Include the diagonal and retain a checked one-past-the-end sentinel.
-    return Base.checked_add(start, r - i + 1)
+    return r - i + one(I)
+end
+
+@inline function _checked_skyline_end(start::I, n::I, i::I, r::I, previous::I) where {I<:_SchurIndexWidth}
+    # Include the diagonal and retain a native-width one-past-the-end sentinel.
+    return Base.checked_add(start, _checked_skyline_width(n, i, r, previous))
 end
 
 _skyline_slots(shape::_ClosedSkyline) = shape.offsets[end] - 1
 
-# Divide before multiplying so representable triangular counts are not
-# rejected by an intermediate overflow.
-@inline function _schur_triangle_slots(n::Int)
+# Route comparisons use hypothetical sizes. In particular, the triangular
+# denominator (or a candidate envelope that would be rejected by the gate)
+# can exceed native Int even though the storage actually selected fits.
+# Keep this scan allocation-free: only selected sparse storage needs offsets.
+function _schur_route_slots(reaches::AbstractVector{I}) where {I<:_SchurIndexWidth}
+    Base.require_one_based_indexing(reaches)
+    n = I(length(reaches))
+    W = widen(I)
+    total = zero(W)
+    previous = zero(I)
+    for (i, r) in enumerate(reaches)
+        total = Base.checked_add(total, W(_checked_skyline_width(n, I(i), r, previous)))
+        previous = r
+    end
+    return total
+end
+
+@inline function _schur_triangle_slots(n::I) where {I<:_SchurIndexWidth}
     n >= 0 || throw(ArgumentError("Schur dimension must be nonnegative, got $n"))
-    iseven(n) && return Base.checked_mul(n ÷ 2, Base.checked_add(n, 1))
-    return Base.checked_mul(n, n ÷ 2 + 1)
+    dim = widen(n)
+    return Base.checked_mul(dim, Base.checked_add(dim, one(dim))) ÷ 2
+end
+
+# Exact comparison for the routing constants (1/4 and 2/5). Computing
+# floor(total * numerator / denominator) by quotient and remainder avoids
+# overflowing even if the widened triangle itself is close to its limit.
+@inline function _schur_density_exceeds(slots::Integer, total::Integer, numerator::Int, denominator::Int)
+    q, r = divrem(total, denominator)
+    return slots > q * numerator + (r * numerator) ÷ denominator
 end
 
 struct _SchurSkyline{T<:Real}

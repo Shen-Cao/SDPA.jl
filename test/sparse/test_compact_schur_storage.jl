@@ -23,10 +23,34 @@ using Test
     # Test a real representability boundary without allocating the profile.
     @test SDPA._checked_skyline_end(typemax(Int) - 1, 1, 1, 1, 1) == typemax(Int)
     @test_throws OverflowError SDPA._checked_skyline_end(typemax(Int), 1, 1, 1, 1)
-    n = Int((isqrt(1 + 8big(typemax(Int))) - 1) ÷ 2)
-    @test SDPA._schur_triangle_slots(n) == (big(n) * (big(n) + 1)) ÷ 2
-    @test_throws OverflowError SDPA._schur_triangle_slots(n + 1)
     @test_throws ArgumentError SDPA._schur_triangle_slots(-1)
+    @test_throws ArgumentError SDPA._schur_route_slots([3, 2, 3])
+
+    # Simulate a 32-bit Int environment. The actual diagonal storage fits
+    # native offsets, but both a hypothetical dense profile and the
+    # denominator overflow Int32. Routing must not allocate either one.
+    n32 = Int32(65_536)
+    diagonal = SDPA._schur_route_slots(Int32(1):n32)
+    full = SDPA._schur_triangle_slots(n32)
+    hypothetical = SDPA._schur_route_slots(fill(n32, Int(n32)))
+    @test full === hypothetical === Int64(2_147_516_416)
+    @test diagonal === Int64(n32)
+    @test diagonal < typemax(Int32) < full
+    @test !SDPA._schur_density_exceeds(diagonal, full, 1, 4)
+    @test !SDPA._schur_density_exceeds(diagonal, full, 2, 5)
+    @test SDPA._schur_density_exceeds(hypothetical, full, 1, 4)
+    @test SDPA._schur_density_exceeds(hypothetical, full, 2, 5)
+    @test SDPA._checked_skyline_end(typemax(Int32) - Int32(1), n32, n32, n32, n32) === typemax(Int32)
+    @test_throws OverflowError SDPA._checked_skyline_end(typemax(Int32), n32, n32, n32, n32)
+
+    # Boundary comparisons remain exact even above Float64 integer resolution.
+    fullwide = SDPA._schur_triangle_slots(typemax(Int64))
+    @test fullwide == (big(typemax(Int64)) * (big(typemax(Int64)) + 1)) ÷ 2
+    for (num, den) in ((1, 4), (2, 5))
+        boundary = Int128((big(fullwide) * num) ÷ den)
+        @test !SDPA._schur_density_exceeds(boundary, fullwide, num, den)
+        @test SDPA._schur_density_exceeds(boundary + 1, fullwide, num, den)
+    end
 
     empty_profile = SDPA._SchurSkyline{Float64}(Int[])
     @test empty_profile.offsets == [1]
