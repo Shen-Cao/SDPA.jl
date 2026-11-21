@@ -5,6 +5,12 @@ which cost factors are verified, which hypotheses were tested and
 rejected, and which gaps remain. Planned work lives in
 [roadmap.md](roadmap.md).
 
+For a fresh head-to-head run, use the
+[paired SDPA-GMP harness](../benchmark/parity/README.md). It validates the
+timed runs' actual witnesses on the same input and reports matched core
+budgets and peak RSS. The historical NSPS comparisons below used different
+thread counts and are not new matched-accuracy release benchmarks.
+
 The reference workload is NSPS (m=10259, 4 SDP blocks of 71×71, 1 LP
 block of 14536) at 200-256-bit precision against C++ SDPA-GMP. All
 wall-clock numbers on this page come from a single reference machine

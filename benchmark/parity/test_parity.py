@@ -1,0 +1,232 @@
+import copy
+from decimal import Decimal as D, localcontext
+import os
+from pathlib import Path
+import shutil
+import subprocess
+import sys
+import tempfile
+from types import SimpleNamespace
+import unittest
+
+from run import REPO, assess, cpu_set, parameter_text, run_child
+from witness import Invalid, cone_gate, read_problem, read_witness, validate
+
+
+# Standard-form min <C,Y>, <A,Y>=6 becomes displayed SDPA min b*x,
+# X=x*A-(-C). For x=-2, X=[[1,-1],[-1,1]] and Y=ones(2,2).
+SDP = """1 = mDIM
+1 = nBLOCK
+{2} = blocks
+6
+0 1 1 1 -5
+0 1 1 2 -1
+0 1 2 2 -5
+1 1 1 1 2
+1 1 1 2 1
+1 1 2 2 2
+"""
+DISPLAY = """xVec =
+{-2}
+xMat =
+{ {{1,-1},{-1,1}} }
+yMat =
+{ {{1,1},{1,1}} }
+"""
+# LP-first then PSD then a size-one LP block. The two LP blocks must not
+# be merged or permuted in the displayed witness.
+MIXED = """1
+3
+{-2, 2, 1}
+1
+0 1 1 1 1
+0 2 1 1 1
+0 2 1 2 1
+0 2 2 2 1
+1 1 1 1 1
+1 1 2 2 2
+1 2 1 1 2
+1 2 1 2 1
+1 2 2 2 2
+1 3 1 1 1
+"""
+MIXED_DISPLAY = """xVec =
+{1}
+xMat =
+{ {0,2} {{1,0},{0,1}} {1} }
+yMat =
+{ {1,0} {{0,0},{0,0}} {0} }
+"""
+ZERO_COLD = """xVec =
+{0}
+xMat =
+{ {{10000,0},{0,10000}} }
+yMat =
+{ {{10000,0},{0,10000}} }
+"""
+
+
+def julia_text(body=DISPLAY, phase="pdOPT", reason="OPTIMAL_TERMINAL", iterations=2):
+    return f"""phase.value = {phase}
+Iteration = {iterations}
+exit reason = {reason}
+precision = 256
+threads = 1
+julia = 1.13.0
+mpfr = 4.2.2
+blas = LBTConfig([ILP64] libopenblas64_.so)
+read_seconds = 0.1
+solve_seconds = 0.2
+solve_core_seconds = 0.15
+""" + body
+
+
+class ParityOracle(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.directory = Path(self.tmp.name)
+
+    def files(self, data=SDP, result=julia_text()):
+        p = self.directory / "problem.dat-s"
+        p.write_text(data, encoding="ascii")
+        w = self.directory / "witness.out"
+        w.write_text(result, encoding="ascii")
+        return read_problem(p), w
+
+    def test_exact_native_cpp_gold(self):
+        p = read_problem(REPO / "test/fixtures/example1.dat-s")
+        w = read_witness(REPO / "test/reference/example1.dat-s.result", p, "cpp")
+        self.assertEqual((w.phase, w.iterations), ("pdOPT", 39))
+        result = validate(p, w, D("1e-30"), 112)
+        self.assertTrue(result["accuracy_passed"])
+        self.assertLess(D(result["primal_objective"]), D("-41.899999999999"))
+
+    def test_indefinite_dual_does_not_hide_behind_perfect_arithmetic(self):
+        p, path = self.files()
+        w = read_witness(path, p, "julia")
+        self.assertTrue(validate(p, w, D("1e-30"), 80)["accuracy_passed"])
+        # Feasibility, both objectives, gap, and raw complementarity remain
+        # exact. Testing only objectives/residuals would report a false pass.
+        bad = copy.deepcopy(w)
+        bad.Y[0][0][0], bad.Y[0][1][1] = D(2), D(0)
+        result = validate(p, bad, D("1e-30"), 80)
+        for key in ("relative_gap", "primal_residual", "dual_residual", "complementarity"):
+            self.assertEqual(D(result[key]), D(0))
+        self.assertFalse(result["dual_cone"])
+        self.assertFalse(result["accuracy_passed"])
+
+    def test_shifted_cone_margin_and_skew(self):
+        with localcontext() as ctx:
+            ctx.prec = 100
+            s, c, _ = cone_gate([[D("1"), D(2)], [D(2), D(4)]], D("1e-35"), 80)
+            self.assertTrue(s and c)  # non-diagonally-dominant rank-one PSD
+            s, c, _ = cone_gate([[D(1), D(3)], [D(2), D(9)]], D("1e-35"), 80)
+            self.assertFalse(s)
+            self.assertTrue(c)       # symmetry isn't silently repaired to a pass
+            s, c, _ = cone_gate([[D(1), D("1.0000000001")],
+                                [D("1.0000000001"), D(1)]], D("1e-12"), 80)
+            self.assertTrue(s)
+            self.assertFalse(c)
+
+    def test_input_digits_beyond_binary64_change_the_verdict(self):
+        p, path = self.files(data=MIXED.replace("\n1\n0", "\n1.000000000000000000000000000000000000000000005\n0"),
+                             result=julia_text(MIXED_DISPLAY))
+        self.assertEqual(float(p.b[0]), 1.0)
+        row = validate(p, read_witness(path, p, "julia"), D("1e-50"), 94)
+        self.assertFalse(row["accuracy_passed"])
+        self.assertGreater(D(row["dual_residual"]), D("1e-46"))
+
+    def test_block_layout_and_missing_numbers(self):
+        p, path = self.files(data=MIXED, result=julia_text(MIXED_DISPLAY))
+        w = read_witness(path, p, "julia")
+        self.assertTrue(validate(p, w, D("1e-30"), 80)["accuracy_passed"])
+        for changed in (
+            MIXED_DISPLAY.replace("{0,2}", "{0}"),
+            MIXED_DISPLAY.replace("{0,2}", "{0,NaN}"),
+            MIXED_DISPLAY.replace("{0,2}", "{0,2} {0}"),
+            MIXED_DISPLAY.replace("{0,2}", "{0,2,}"),
+            MIXED_DISPLAY.replace("{0,2}", "{0,2}") + "unparsed extra section",
+        ):
+            with self.subTest(changed=changed):
+                _, result = self.files(data=MIXED, result=julia_text(changed))
+                with self.assertRaises(Invalid):
+                    read_witness(result, p, "julia")
+
+    def test_shared_input_rejects_incompatible_or_ambiguous_data(self):
+        for data in (SDP + "1 1 2 1 1\n", SDP + "1 1 1 1 2\n", SDP + "1 1 1\n",
+                     "\n" + SDP, SDP.replace("\n6\n", "\n.6\n"),
+                     MIXED + "1 1 1 2 3\n", SDP.replace("1 1 2 2 2", "1 1 2 2 NaN")):
+            with self.subTest(data=data):
+                with self.assertRaises(Invalid):
+                    self.files(data=data)
+
+    def test_shell_success_not_enough_and_fixed_iterations_not_accuracy(self):
+        args = SimpleNamespace(threads=1, bits=256, target=D("1e-30"), guard_digits=80,
+                               iteration_cap=3, fixed_iterations=None)
+        (self.directory / "stderr.log").write_text("Using dense Schur complement path\n")
+        cases = [
+            ("solver_status", julia_text(reason="CHOLESKY_FAILURE"), None),
+            ("solver_status", julia_text(phase="pdINF"), None),
+            ("invalid_result", julia_text().replace("{-2}", "{NaN}"), None),
+            ("accuracy_failed", julia_text(DISPLAY.replace("{-2}", "{-1}")), None),
+            ("invalid_result", julia_text().replace("threads = 1", "threads = 9"), None),
+            ("incomplete_iterations", julia_text(ZERO_COLD, "noINFO", "MAX_ITERATION", 1), 2),
+            ("diagnostic_complete", julia_text(ZERO_COLD, "noINFO", "MAX_ITERATION", 2), 2),
+        ]
+        for expected, result, cap in cases:
+            with self.subTest(expected=expected):
+                p, path = self.files(result=result)
+                row = {"solver": "julia", "exit_code": 0, "timed_out": False}
+                args.fixed_iterations = cap
+                assess(row, path, p, args, 256)
+                self.assertEqual(row["status"], expected)
+                if cap and expected == "diagnostic_complete":
+                    self.assertFalse(row["validation"]["accuracy_passed"])
+        row = {"solver": "cpp", "exit_code": 0, "timed_out": False}
+        assess(row, self.directory / "missing.out", p, args, 256)
+        self.assertEqual(row["status"], "invalid_result")
+
+    def test_parameter_lines_are_explicit_and_include_four_formats(self):
+        controls, param = parameter_text(REPO / "test/fixtures/param.sdpa", 200, 3, 95)
+        self.assertEqual((controls["maxIteration"], controls["precision"]), ("3", "200"))
+        self.assertEqual(controls["epsilonStar"], "1.0E-30")
+        lines = param.splitlines()
+        self.assertEqual(len(lines), 15)
+        self.assertEqual(lines[-4], "%+.95Fe  xPrint")
+        self.assertEqual(lines[-1], "%+.95Fe  infPrint")
+
+
+@unittest.skipUnless(sys.platform == "linux" and hasattr(os, "pidfd_open") and shutil.which("cc"),
+                     "needs Linux pidfd and a C compiler")
+class MeasurementBoundary(unittest.TestCase):
+    def test_child_status_timeout_and_rss_not_inherited_from_python(self):
+        with tempfile.TemporaryDirectory() as t:
+            tmp = Path(t)
+            helper = tmp / "measure"
+            subprocess.run(["cc", "-o", str(helper), str(Path(__file__).with_name("measure_child.c"))],
+                           check=True)
+            cpus = cpu_set(None, 1)
+            # Keep pages alive and resident; a plain Python wait4() on its
+            # child sees this parent heap before exec.
+            allocated = bytearray(48 * 1024**2)
+            for i in range(0, len(allocated), 4096):
+                allocated[i] = 42
+            ok_dir = tmp / "ok"
+            ok_dir.mkdir()
+            row = run_child(helper, ["/bin/sh", "-c", "exit 7"], ok_dir, dict(os.environ), cpus, 10)
+            self.assertEqual(row["exit_code"], 7)
+            self.assertLess(row["peak_rss_bytes"], len(allocated) // 2)
+            self.assertGreater(row["wall_seconds"], 0)
+            kill_dir = tmp / "killed"
+            kill_dir.mkdir()
+            row = run_child(helper, ["/bin/sh", "-c", "sleep 30; echo unexpected"], kill_dir,
+                            dict(os.environ), cpus, 0.05)
+            self.assertTrue(row["timed_out"])
+            self.assertLess(row["external_elapsed_seconds"], 5)
+            self.assertIsNone(row["peak_rss_bytes"])
+            self.assertEqual((kill_dir / "stdout.log").read_bytes(), b"")
+
+
+if __name__ == "__main__":
+    unittest.main()
