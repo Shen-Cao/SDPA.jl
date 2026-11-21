@@ -444,10 +444,8 @@
         # (c) TIME_LIMIT is covered in the time-limit testset above (both
         # the timed-out branch and the converged branch).
 
-        # (d) CHOLESKY_FAILURE / CANNOT_MOVE: no cheap deterministic
-        # trigger exists in the fixture suite (they need a numerically
-        # degenerate iterate mid-solve); the enum assignments at those
-        # break sites are exercised only by code inspection. Not tested.
+        # (d) A singular Schur system and a valid tiny step exercise
+        # CHOLESKY_FAILURE and CANNOT_MOVE in test_iterate_acceptance.jl.
     end
 
     @testset "MOI TerminationStatus maps MAX_ITERATION to ITERATION_LIMIT" begin

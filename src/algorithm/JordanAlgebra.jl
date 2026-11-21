@@ -210,6 +210,38 @@ function get_inv_chol!(
     return true
 end
 
+# Leave the diagonal alone: averaging an entry with itself can overflow.
+# Keep add-then-halve for normal and subnormal results. Split the operands
+# only when the sum of two finite values overflows (then halving is safe).
+function _symmetrize_inverse!(A::Matrix{T}, scratch) where {T<:Real}
+    @inbounds for j in 2:size(A, 2), i in 1:j-1
+        a, b = A[i, j], A[j, i]
+        s = a + b
+        v = isinf(s) && isfinite(a) && isfinite(b) ? a/2 + b/2 : s/2
+        A[i, j] = v
+        A[j, i] = v
+    end
+    return A
+end
+
+function _symmetrize_inverse!(A::Matrix{BigFloat}, scratch::Tuple{BigFloat,BigFloat})
+    avg, two = scratch
+    @inbounds for j in 2:size(A, 2), i in 1:j-1
+        a, b = A[i, j], A[j, i]
+        mp_add!(avg, a, b)
+        if isinf(avg) && isfinite(a) && isfinite(b)
+            mp_div!(avg, a, two)
+            mp_div!(b, b, two)  # Output slot; both slots are overwritten below.
+            mp_add!(avg, avg, b)
+        else
+            mp_div!(avg, avg, two)
+        end
+        mp_set!(a, avg)
+        mp_set!(b, avg)
+    end
+    return A
+end
+
 """
     get_inv_chol_and_inv!(inv_chol_mat, inverse_mat, a_mat, work_mat) -> Bool
 
@@ -259,38 +291,8 @@ function get_inv_chol_and_inv!(
         # not bit-identical). MUST stay kernel-identical with the
         # threaded variant (bit-identical across thread counts).
         Rgemm!("T", "N", n, n, n, one(T), L_inv, L_inv, zero(T), inv_blk)
-        # Force symmetry (numerical cleanup). BigFloat: value-copy via
-        # mp_set! — `inv_blk[i, j] = avg` would store the SAME BigFloat
-        # object in both transposed slots, so a later in-place MPFR op on
-        # one would corrupt the mirrored entry. Float64 assignment is
-        # already value-semantic.
-        #
-        # The BigFloat path uses ONE scratch BigFloat (plus a
-        # pre-allocated exact `two`) allocated once per block instead of
-        # two fresh temporaries per element. The rounding chain is
-        # reproduced op-for-op: `(a + b) / 2` = one rounded mpfr_add
-        # (mp_add!) then an EXACT halving — division by 2 is exact in
-        # binary floating point (pure exponent decrement, no rounding at
-        # any precision), and Base's `x / 2` is the same mpfr_div by the
-        # exactly-representable BigFloat(2) — so the scratch path is
-        # bit-identical by construction. MUST stay kernel-identical with
-        # the threaded variant (bit-identical across thread counts).
-        if T <: BigFloat
-            avg_buf = zero(BigFloat)
-            two = BigFloat(2)
-            @inbounds for j in 1:n, i in 1:j
-                mp_add!(avg_buf, inv_blk[i, j], inv_blk[j, i])
-                mp_div!(avg_buf, avg_buf, two)
-                mp_set!(inv_blk[i, j], avg_buf)
-                mp_set!(inv_blk[j, i], avg_buf)
-            end
-        else
-            @inbounds for j in 1:n, i in 1:j
-                avg = (inv_blk[i, j] + inv_blk[j, i]) / 2
-                inv_blk[i, j] = avg
-                inv_blk[j, i] = avg
-            end
-        end
+        scratch = T === BigFloat ? (zero(BigFloat), BigFloat(2)) : nothing
+        _symmetrize_inverse!(inv_blk, scratch)
     end
     @inbounds for k in eachindex(a_mat.LP_block)
         if a_mat.LP_block[k] <= 0

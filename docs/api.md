@@ -75,13 +75,31 @@ Enum for solver phase:
 
 Enum for why the IPM loop terminated (reported in
 `SolutionLog.exit_reason`): `OPTIMAL_TERMINAL`, `MAX_ITERATION`,
-`CHOLESKY_FAILURE`, `CANNOT_MOVE`, `TIME_LIMIT`, `EMPTY_PROBLEM`.
+`CHOLESKY_FAILURE`, `CANNOT_MOVE`, `TIME_LIMIT`, `EMPTY_PROBLEM`, `NONFINITE_STEP`.
 `terminal_phase` alone cannot distinguish a healthy terminal phase from
 one frozen mid-solve by a non-terminal exit (iteration budget, Cholesky
 failure, cannot move, time limit); this enum can. The MOI layer consumes
 it for `TerminationStatus` (`MAX_ITERATION` → `ITERATION_LIMIT`,
-`CHOLESKY_FAILURE`/`CANNOT_MOVE` → `OTHER_LIMIT`, `TIME_LIMIT` →
-`TIME_LIMIT`).
+`CHOLESKY_FAILURE`/`CANNOT_MOVE` → `OTHER_LIMIT`, `NONFINITE_STEP` →
+`NUMERICAL_ERROR`, `TIME_LIMIT` →
+`TIME_LIMIT`). If a proposed step loses positive definiteness or its inverse factors
+cannot be represented finitely, the solver
+halves the two step lengths together and checks again, at most twenty times.
+A failed candidate keeps the last accepted point. A strictly
+interior tiny step is counted, and its diagnostics are recomputed before
+reporting stagnation.
+
+With no equality constraints, nonfinite objective coefficients raise an
+`ArgumentError`. A constraint-free objective can be stored at higher BigFloat
+precision than the requested solve. The shortcut rounds its slack to solve
+precision and reports the residual against the stored coefficients:
+`final_dual_res` in forward mode or `final_primal_res` in REVERSE display.
+If this exceeds `epsilonDash`, the solve reports `CANNOT_MOVE` instead of
+a two-sided optimum (`pFEAS` in forward mode, `dFEAS` in REVERSE).
+
+The SDP cone classification still uses working-precision eigenvalues.
+Near rank deficiency, rounding to fewer bits can change the sign of a
+boundary eigenvalue. Do not reduce precision when that distinction matters.
 
 ### `NewtonState{T<:Real}`
 

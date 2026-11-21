@@ -6,19 +6,12 @@ distinguish a healthy terminal phase from one frozen mid-solve by a
 non-terminal exit (maxIteration / Cholesky failure / cannot-move /
 time limit).
 
-Assignment rule: the loop starts at `OPTIMAL_TERMINAL` and every
-NON-terminal break overwrites it — `TIME_LIMIT` exactly where `timed_out`
-is set, `CHOLESKY_FAILURE` at the two `mehrotra!` failure breaks,
-`CANNOT_MOVE` when `update!` reports the iterate cannot move. The pdFEAS
-early stop (`beta.value > 5 || objP < objD`, C++ sdpa_main.cpp:337-340
-parity) is a healthy termination and keeps `OPTIMAL_TERMINAL`. The
-while-condition's `maxIteration` leg is not a break site, so it is
-disambiguated after the loop: `OPTIMAL_TERMINAL` is upgraded to
-`MAX_ITERATION` iff `continue_iter` was still true AND
-`iter >= params.maxIteration` (every mid-body break fires before the
-`iter` increment, so a break can never satisfy that inequality).
-`EMPTY_PROBLEM` is set by the trivial-problem early exit, before the
-loop ever runs.
+A terminal phase, including the C++ pdFEAS early-stop heuristic, uses
+`OPTIMAL_TERMINAL`. Otherwise the reason distinguishes an iteration
+or time limit, a failed Schur/iterate Cholesky (`CHOLESKY_FAILURE`),
+a non-finite candidate (`NONFINITE_STEP`), or a valid step so small
+that no further progress is expected (`CANNOT_MOVE`). Rejected steps
+are not counted and never replace the last accepted point.
 """
 @enum ExitReason begin
     OPTIMAL_TERMINAL
@@ -27,6 +20,7 @@ loop ever runs.
     CANNOT_MOVE
     TIME_LIMIT
     EMPTY_PROBLEM
+    NONFINITE_STEP
 end
 
 """
@@ -97,26 +91,36 @@ end
 # Parity with the C++ reference output: example1 → -41.9 (39 iters),
 # arch0 → +0.5665 (53 iters).
 
-"""Negate all entries of the objective matrix C in-place."""
-function _negate_C!(problem::SDPAProblem{T}) where {T<:Real}
+"""Write the negated stored coefficients into the independent objective copy."""
+function _negate_C!(problem::SDPAProblem{T}, source::SDPASparseLinearSpace{T}=problem.C,
+                    negate::F=(-)) where {T<:Real,F}
     for sdp_k in 1:problem.C.SDP_sp_nBlock
+        isassigned(source.SDP_sp_block, sdp_k) || continue
+        src = source.SDP_sp_block[sdp_k]
         blk = problem.C.SDP_sp_block[sdp_k]
         if blk.type === :sparse
             for nz in 1:blk.nonZeroEffect
-                blk.sp_ele[nz] = -blk.sp_ele[nz]
+                blk.sp_ele[nz] = negate(src.sp_ele[nz])
             end
         else
             for k in eachindex(blk.de_ele)
-                blk.de_ele[k] = -blk.de_ele[k]
+                blk.de_ele[k] = negate(src.de_ele[k])
             end
         end
     end
     # LP entries: iterate the compact nonzero list of C. Negating a
     # nonzero keeps it nonzero, so the compact form is preserved.
     for lp_pos in 1:problem.C.LP_nnz
-        problem.C.LP_sp_val[lp_pos] = -problem.C.LP_sp_val[lp_pos]
+        problem.C.LP_sp_val[lp_pos] = negate(source.LP_sp_val[lp_pos])
     end
     return problem
+end
+
+# Sign reversal itself is exact. For an m=0 certificate, retain the stored
+# source precision until C is compared with the actual working-precision slack.
+@inline function _negate_constraint_free_coefficient(v::BigFloat)
+    precision(v) <= precision(BigFloat) && return -v
+    return mp_neg!(BigFloat(0; precision=precision(v)), v)
 end
 
 # Shallow problem copy with a negated VALUE copy of C, so the
@@ -133,7 +137,11 @@ function _problem_with_negated_C(problem::SDPAProblem{T}) where {T<:Real}
         problem.b, C_copy, problem.A,
     )
     initialize_index!(problem_copy)
-    _negate_C!(problem_copy)
+    if T === BigFloat && problem.m == 0
+        _negate_C!(problem_copy, problem.C, _negate_constraint_free_coefficient)
+    else
+        _negate_C!(problem_copy)
+    end
     return problem_copy
 end
 
@@ -293,40 +301,19 @@ function solve!(
     # part of the public API.
     _test_throw_after_blas::Bool=false,
 ) where {T<:Real}
-    # Never mutate the caller's problem. With the REVERSE
-    # convention the solver needs -C internally (C++ sdpa_tool.h:84), so
-    # solve a shallow copy whose C is a negated value copy. The caller's
-    # problem is left untouched on every path, making solve! safe to call
-    # concurrently on the same problem object.
-    if reverse_primal_dual
-        problem = _problem_with_negated_C(problem)
-    else
-        # This path solves the caller's problem object directly. Readers
-        # and MOI ingest populate the derived aggregate index tables, but
-        # a manually constructed SDPAProblem never has initialize_index!
-        # called — with empty tables the solve would silently produce a
-        # zero Schur complement, wrong objectives, and noINFO. Populate
-        # the tables if they were never initialized (derived data only;
-        # no user-visible mutation).
-        _ensure_index_tables!(problem)
-    end
-    if T <: BigFloat
-        log = setprecision(BigFloat, params.precision) do
-            return _solve_inner!(problem, params, verbose, io, force_sparse, init;
-                                 time_limit_sec=time_limit_sec,
-                                 _test_throw_after_blas=_test_throw_after_blas)
-        end
-    else
-        log = _solve_inner!(problem, params, verbose, io, force_sparse, init;
+    # Negation, independent value copies and display arithmetic all allocate
+    # their BigFloat destinations at the current precision. Keep the entire
+    # raw solve, not just Newton iterations, in the requested scope.
+    function run()
+        # Input A/b are read-only. In REVERSE mode only C is copied/negated;
+        # otherwise a manually built problem may need its derived indices.
+        p = reverse_primal_dual ? _problem_with_negated_C(problem) : _ensure_index_tables!(problem)
+        log = _solve_inner!(p, params, verbose, io, force_sparse, init;
                             time_limit_sec=time_limit_sec,
                             _test_throw_after_blas=_test_throw_after_blas)
+        return reverse_primal_dual ? _reverse_display(log) : log
     end
-    # Apply the REVERSE display transformation whenever reverse_primal_dual
-    # is set (regardless of the solve's terminal phase).
-    if reverse_primal_dual
-        log = _reverse_display(log)
-    end
-    return log
+    return T === BigFloat ? setprecision(run, BigFloat, params.precision) : run()
 end
 
 # ---------------------------------------------------------------------------
@@ -405,6 +392,31 @@ function _solve_inner!(
     end
 end
 
+# The m=0 shortcut certifies the point directly; NaN/Inf is not a
+# semidefinite coefficient or an unboundedness certificate. Validate all
+# stored coordinates BEFORE an early negative block can bypass later data.
+function _check_constraint_free_objective(C::SDPASparseLinearSpace)
+    for k in eachindex(C.SDP_sp_block)
+        isassigned(C.SDP_sp_block, k) || continue
+        block = C.SDP_sp_block[k]
+        vals = block.type === :dense ? block.de_ele : view(block.sp_ele, 1:block.nonZeroEffect)
+        all(isfinite, vals) || throw(ArgumentError(
+            "constraint-free objective C must be finite (SDP block $(C.SDP_sp_index[k]))"))
+    end
+    for pos in 1:C.LP_nnz
+        isfinite(C.LP_sp_val[pos]) || throw(ArgumentError(
+            "constraint-free objective C must be finite (LP coordinate $(C.LP_sp_index[pos]))"))
+    end
+    return nothing
+end
+
+# Equal-or-lower-precision inputs copy exactly. Avoid allocating BigFloat
+# temporaries for each matrix entry in the usual same-precision solve.
+@inline function _constraint_free_roundoff(res::BigFloat, src::BigFloat, dst::BigFloat)
+    precision(src) <= precision(dst) && return res
+    return max(res, abs(src - dst))
+end
+
 function _solve_inner_locked!(
     problem::SDPAProblem{T}, params::Parameters{T},
     verbose::Bool, io::IO, force_sparse::Bool=false,
@@ -442,6 +454,7 @@ function _solve_inner_locked!(
             copy(init)
         # Trivial-problem early exit, m == 0: with no constraints the
         # problem min ⟨C, X⟩ s.t. X ⪰ 0 is decidable without any IPM work.
+        problem.m == 0 && _check_constraint_free_objective(problem.C)
         if problem.m == 0 && current_pt.nDim == 0
             # Nothing to optimize at all: no constraints and no variables.
             # The general path would run the full allocation +
@@ -486,7 +499,9 @@ function _solve_inner_locked!(
                 end
             end
             semidefinite = true
+            dual_res = zero(T)
             for k in eachindex(problem.C.SDP_sp_index)
+                isassigned(problem.C.SDP_sp_block, k) || continue
                 l = problem.C.SDP_sp_index[k]
                 pos = sdp_slot_of_block[l]
                 smat = problem.C.SDP_sp_block[k]
@@ -506,37 +521,57 @@ function _solve_inner_locked!(
                         dense[c, r] = v
                     end
                 end
-                _copyto_independent!(z.SDP_block[pos].de_ele, dense)
+                z_block = z.SDP_block[pos].de_ele
+                _copyto_independent!(z_block, dense)
+                if T === BigFloat
+                    # Stored input can have higher precision than the solve.
+                    for idx in eachindex(dense, z_block)
+                        dual_res = _constraint_free_roundoff(dual_res, dense[idx], z_block[idx])
+                    end
+                end
                 if min_eigen_qr_block(dense) < 0
                     semidefinite = false
                     break
                 end
             end
             if semidefinite
-                for lp_k in 1:z.LP_nBlock
-                    if get_lp_value(problem.C, lp_k) < 0
+                # Z = C on LP coordinates too. Missing compact entries are
+                # already zero in z; copy the stored values independently.
+                for pos in 1:problem.C.LP_nnz
+                    lp_k = problem.C.LP_sp_index[pos]
+                    v = problem.C.LP_sp_val[pos]
+                    if v < 0
                         semidefinite = false
                         break
+                    end
+                    if T === BigFloat
+                        mp_set!(z.LP_block[lp_k], v)
+                        dual_res = _constraint_free_roundoff(dual_res, v, z.LP_block[lp_k])
+                    else
+                        z.LP_block[lp_k] = v
                     end
                 end
             end
             if semidefinite
                 x0 = SDPADenseLinearSpace{T}(problem.blockStruct)  # X = 0
+                # X=0 attains the primal optimum. The best representable
+                # Z=round(C) may nevertheless miss the requested dual tolerance.
+                dual_feasible = dual_res <= params.epsilonDash
                 return SolutionLog{T}(
                     0,                     # iterations: decidable, no IPM work
-                    pdOPT,                 # optimum 0 at X = 0, Z = C
+                    dual_feasible ? pdOPT : pFEAS,
                     IterationRow{T}[],
                     zero(T),               # ⟨C, 0⟩ = 0
                     zero(T),               # ⟨b=∅, y⟩ = 0
                     zero(T),               # ⟨0, C⟩/nDim = 0
                     zero(T),               # no constraints: primal residual 0
-                    zero(T),               # Z = C exactly: dual residual 0
+                    dual_res,              # actual residual of the returned Z
                     x0,
                     copy(current_pt.yVec), # empty
-                    z,                     # Z = C (the optimal dual slack)
+                    z,                     # C at the requested precision
                     (mehrotra=0.0, eigen=0.0, residual=0.0, total=0.0),
                     false,
-                    OPTIMAL_TERMINAL,
+                    dual_feasible ? OPTIMAL_TERMINAL : CANNOT_MOVE,
                 )
             end
         end
@@ -812,7 +847,15 @@ function _solve_inner_locked!(
             )
             t_eigen[] += time_ns() - t0
 
-            # --- LOG + STEP ---
+            # --- VALIDATE AND COMMIT STEP ---
+            outcome = _update_iterate!(current_pt, alpha, newton, work)
+            if outcome === _NOT_POSDEF || outcome === _NONFINITE_STEP
+                exit_reason = outcome === _NOT_POSDEF ? CHOLESKY_FAILURE : NONFINITE_STEP
+                break
+            end
+
+            # Log the accepted step against its *pre-step* scalars. A
+            # viable tiny step is included and gets the same bookkeeping.
             row = IterationRow{T}(
                 iter, mu.current, theta.primal, theta.dual,
                 solve_info.objValPrimal, solve_info.objValDual,
@@ -824,12 +867,6 @@ function _solve_inner_locked!(
                     row.iter, row.mu, row.thetaP, row.thetaD,
                     row.objP, row.objD, row.alphaP, row.alphaD, row.beta)
                 flush(io)
-            end
-            moved = update!(current_pt, alpha, newton, work)
-            if !moved
-                # "Cannot move" or Cholesky failure.
-                exit_reason = CANNOT_MOVE
-                break
             end
 
             # --- UPDATE BOOKKEEPING ---
@@ -862,16 +899,14 @@ function _solve_inner_locked!(
                 solve_info.rho,
                 params,
             )
+            if outcome === _TINY_STEP && continue_iter
+                exit_reason = CANNOT_MOVE
+                break
+            end
         end
 
-        # The while-condition's maxIteration leg is not a break site,
-        # so disambiguate it here. If no non-terminal reason was recorded,
-        # the loop was still willing to continue (continue_iter true —
-        # false means the terminal check won and OPTIMAL_TERMINAL stands,
-        # even when iter happens to equal maxIteration), and the budget is
-        # exhausted, the exit was MAX_ITERATION. Every mid-body break above
-        # fires BEFORE `iter += 1`, so at any break `iter < maxIteration`
-        # still holds — this inequality can only be met via the while leg.
+        # A terminal phase takes precedence when reached on the final
+        # allowed iteration; an explicitly recorded failure also stands.
         if exit_reason == OPTIMAL_TERMINAL && continue_iter &&
            iter >= params.maxIteration
             exit_reason = MAX_ITERATION

@@ -96,7 +96,9 @@ kept because changing it would alter the converged numerics with no
 correctness or performance gain.
 
 Returns `λ_min - |err_est * beta|` (the Ritz value corrected by the
-sensitivity estimate, matching C++).
+sensitivity estimate, matching C++). This is not a global lower bound:
+an eigenmode orthogonal to the starting Krylov space can go unseen. The
+solver checks the actual candidate factors before accepting a step.
 """
 function min_eigen_lanczos(
     l_mat::AbstractMatrix{T}, x_mat::AbstractMatrix{T}, max_iter::Int=0

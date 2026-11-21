@@ -36,9 +36,9 @@
             @test SDPA.min_eigen_dispatch(L, X) ≈ T(1) rtol=eps(T)^0.5
 
             # --- min_eigen_lanczos on larger matrices (n > 20) ---
-            # Lanczos returns `min - |error*beta|` (lower bound). Test:
-            #   (a) estimate <= true λ_min (lower-bound property)
-            #   (b) estimate >= true λ_min - tol (not too far below)
+            # Here every diagonal eigendirection overlaps the seed. Check
+            # the quality of the corrected Ritz estimate for this matrix;
+            # it is not a certified lower bound for an arbitrary matrix.
             n = 50
             Xdiag = Matrix(Diagonal(T.(1:n)))
             L_I = Matrix{T}(I, n, n)

@@ -5,79 +5,95 @@ Mirrors C++ `Solutions::update` at `sdpa_dataset.cpp:120-143`
 and `Solutions::computeInverse` at `:96-118`.
 """
 
+# These internal outcomes distinguish a valid terminal step from a
+# rejected candidate. Only accepted points may enter the solution log.
+@enum _IterateResult _MOVED _TINY_STEP _NOT_POSDEF _NONFINITE_STEP
+
+# The ordinary proposal is at most 100. Twenty halvings take even that
+# below the existing 1e-4 stagnation threshold.
+const _MAX_STEP_HALVINGS = 20
+
+function _trial_axpy!(out::AbstractArray{T}, x::AbstractArray{T}, alpha::T,
+                      dx::AbstractArray{T}) where {T<:Real}
+    finite = true
+    @inbounds @simd for i in eachindex(out, x, dx)
+        v = x[i] + alpha * dx[i]
+        out[i] = v
+        finite &= isfinite(v)
+    end
+    return finite
+end
+
+function _trial_axpy!(out::SDPADenseLinearSpace{T}, x::SDPADenseLinearSpace{T},
+                      alpha::T, dx::SDPADenseLinearSpace{T}) where {T<:Real}
+    for k in eachindex(out.SDP_block, x.SDP_block, dx.SDP_block)
+        _trial_axpy!(out.SDP_block[k].de_ele, x.SDP_block[k].de_ele, alpha,
+                     dx.SDP_block[k].de_ele) || return false
+    end
+    return _trial_axpy!(out.LP_block, x.LP_block, alpha, dx.LP_block)
+end
+
+"""
+    _update_iterate!(pt, alpha, newton, work) -> _IterateResult
+
+Stage X, Z and y in the three Newton RHS buffers. Their contents expire
+after the corrector direction is recovered and the next predictor writes
+them before reading them. No trial point aliases the current iterate.
+Validate the candidate via the *usual* inverse Cholesky computation: the
+accepted first-try path does not require an extra factorization or copy.
+If the estimate missed negative curvature, halve both step lengths together
+and retry from the original point. Stop after the first viable step, an
+invalid tiny step, or the hard retry limit. A viable tiny step is still
+applied, matching the C++ stagnation rule.
+"""
+function _update_iterate!(pt::SDPASolution{T}, alpha::StepLength{T},
+                          newton::NewtonState{T}, work::SDPAWorkVariables{T}) where {T<:Real}
+    x, z, y = newton.r_zinvMat, newton.x_rd_zinvMat, newton.gvec
+    ap, ad = alpha.primal, alpha.dual
+    tiny = T(1e-4)
+    failure = _NOT_POSDEF
+    factors_touched = false
+    for attempt in 0:_MAX_STEP_HALVINGS
+        if _trial_axpy!(x, pt.xMat, ap, newton.DxMat) &&
+           _trial_axpy!(z, pt.zMat, ad, newton.DzMat) &&
+           _trial_axpy!(y.ele, pt.yVec.ele, ad, newton.DyVec.ele)
+            factors_touched = true
+            err = _inverse_failure!(pt, x, z, work)
+            if err === nothing
+                pt.xMat, newton.r_zinvMat = x, pt.xMat
+                pt.zMat, newton.x_rd_zinvMat = z, pt.zMat
+                pt.yVec, newton.gvec = y, pt.yVec
+                # The trajectory and residual bookkeeping consume these values.
+                alpha.primal, alpha.dual = ap, ad
+                return max(ap, ad) < tiny ? _TINY_STEP : _MOVED
+            end
+            failure = err
+        else
+            failure = _NONFINITE_STEP
+        end
+        (max(ap, ad) < tiny || attempt == _MAX_STEP_HALVINGS) && break
+        ap /= 2
+        ad /= 2
+    end
+
+    # Trial factors may be partial. Rebuild the last accepted factors
+    # only if ALL trials failed, not between retries or on ordinary steps.
+    if factors_touched
+        compute_inverse!(pt, work) || error("last accepted iterate has no finite positive-definite factorization")
+    end
+    return failure
+end
+
 """
     update!(current_pt, alpha, newton, work) -> Bool
 
-Apply one IPM iterate update:
-  xMat += alpha.primal * ΔxMat
-  yVec += alpha.dual   * ΔyVec
-  zMat += alpha.dual   * ΔzMat
-
-Returns `false` if both step lengths are below 1e-4 ("cannot move"
-safeguard) OR if the subsequent `compute_inverse!` fails (X or Z lost
-positive-definiteness — triggers main-loop break in the caller).
-
-IMPORTANT (C++ parity, `sdpa_dataset.cpp:120-143`): the xMat/yVec/zMat
-updates are applied BEFORE the cannot-move check. When `false` is
-returned for the cannot-move reason, the iterate therefore HAS the
-(negligible) alpha step applied — the post-step point is the legitimate
-terminal iterate that the caller reports. The `compute_inverse!` failure
-case is the only one where the inverse factors are stale; the caller's
-footer reads the iterates (not the cached inverses), so this is safe.
-
-Mirrors C++ `Solutions::update` at `sdpa_dataset.cpp:120-143`.
+Apply a validated primal/dual step and refresh its inverse factors.
+Returns true if the solve should continue. A valid tiny step is kept;
+a non-finite or non-PD candidate leaves the last accepted point intact.
 """
-function update!(
-    current_pt::SDPASolution{T}, alpha::StepLength{T},
-    newton::NewtonState{T}, work::SDPAWorkVariables{T},
-) where {T<:Real}
-    # xMat += alpha.primal * DxMat
-    for k in 1:current_pt.xMat.SDP_nBlock
-        if isassigned(current_pt.xMat.SDP_block, k) &&
-           isassigned(newton.DxMat.SDP_block, k)
-            xblk = current_pt.xMat.SDP_block[k].de_ele
-            dblk = newton.DxMat.SDP_block[k].de_ele
-            @inbounds @simd for idx in eachindex(xblk)
-                xblk[idx] += alpha.primal * dblk[idx]
-            end
-        end
-    end
-    @inbounds for k in eachindex(current_pt.xMat.LP_block)
-        if k <= length(newton.DxMat.LP_block)
-            current_pt.xMat.LP_block[k] += alpha.primal * newton.DxMat.LP_block[k]
-        end
-    end
-
-    # yVec += alpha.dual * DyVec
-    @inbounds @simd for i in 1:current_pt.mDim
-        current_pt.yVec.ele[i] += alpha.dual * newton.DyVec.ele[i]
-    end
-
-    # zMat += alpha.dual * DzMat
-    for k in 1:current_pt.zMat.SDP_nBlock
-        if isassigned(current_pt.zMat.SDP_block, k) &&
-           isassigned(newton.DzMat.SDP_block, k)
-            zblk = current_pt.zMat.SDP_block[k].de_ele
-            dblk = newton.DzMat.SDP_block[k].de_ele
-            @inbounds @simd for idx in eachindex(zblk)
-                zblk[idx] += alpha.dual * dblk[idx]
-            end
-        end
-    end
-    @inbounds for k in eachindex(current_pt.zMat.LP_block)
-        if k <= length(newton.DzMat.LP_block)
-            current_pt.zMat.LP_block[k] += alpha.dual * newton.DzMat.LP_block[k]
-        end
-    end
-
-    # "Cannot move" safeguard.
-    cannot_move = T(1e-4)
-    if alpha.primal < cannot_move && alpha.dual < cannot_move
-        return false
-    end
-
-    # Recompute inverse Cholesky factors and invzMat.
-    return compute_inverse!(current_pt, work)
+function update!(pt::SDPASolution{T}, alpha::StepLength{T},
+                 newton::NewtonState{T}, work::SDPAWorkVariables{T}) where {T<:Real}
+    return _update_iterate!(pt, alpha, newton, work) == _MOVED
 end
 
 """
@@ -89,43 +105,63 @@ iterate update. Also recomputes `invzMat` (the full Z⁻¹).
 For X: `invCholeskyX = L_x⁻¹` where `X = L_x · L_x'`.
 For Z: `invCholeskyZ = L_z⁻¹` and `invzMat = L_z'⁻¹ · L_z⁻¹ = Z⁻¹`.
 
-Returns `false` if either Cholesky fails (X or Z lost positive-
-definiteness). The caller must handle this (typically by breaking the
-main loop or reducing the step length).
+Returns `false` if either Cholesky fails or an inverse factor cannot be
+represented finitely at the working precision. A failing call may leave
+the caches partially written.
 
 Mirrors C++ `Solutions::computeInverse` at `sdpa_dataset.cpp:96-118`.
 """
 function compute_inverse!(
     current_pt::SDPASolution{T}, work::SDPAWorkVariables{T},
 ) where {T<:Real}
+    return _inverse_failure!(current_pt, current_pt.xMat, current_pt.zMat, work) === nothing
+end
+
+function _finite_blocks(M::SDPADenseLinearSpace)
+    all(isfinite, M.LP_block) || return false
+    for k in eachindex(M.SDP_block)
+        if isassigned(M.SDP_block, k)
+            all(isfinite, M.SDP_block[k].de_ele) || return false
+        end
+    end
+    return true
+end
+
+# Write and validate the factors of the (possibly tentative) matrices.
+# A finite, strictly PD input can still overflow when forming its inverse.
+function _inverse_failure!(current_pt::SDPASolution{T}, x::SDPADenseLinearSpace{T},
+                       z::SDPADenseLinearSpace{T}, work::SDPAWorkVariables{T}) where {T<:Real}
     # Dispatch to threaded variant when multiple threads are available.
     if Threads.nthreads() > 1
         ok_x = threaded_get_inv_chol!(
-            current_pt.invCholeskyX, current_pt.xMat, work.DLS1,
+            current_pt.invCholeskyX, x, work.DLS1,
         )
         if !ok_x
-            return false
+            return _NOT_POSDEF
         end
         ok_z = threaded_get_inv_chol_and_inv!(
-            current_pt.invCholeskyZ, current_pt.invzMat, current_pt.zMat, work.DLS2,
+            current_pt.invCholeskyZ, current_pt.invzMat, z, work.DLS2,
         )
         if !ok_z
-            return false
+            return _NOT_POSDEF
         end
     else
         ok_x = get_inv_chol!(
-            current_pt.invCholeskyX, current_pt.xMat, work.DLS1,
+            current_pt.invCholeskyX, x, work.DLS1,
         )
         if !ok_x
-            return false
+            return _NOT_POSDEF
         end
         ok_z = get_inv_chol_and_inv!(
-            current_pt.invCholeskyZ, current_pt.invzMat, current_pt.zMat, work.DLS2,
+            current_pt.invCholeskyZ, current_pt.invzMat, z, work.DLS2,
         )
         if !ok_z
-            return false
+            return _NOT_POSDEF
         end
     end
 
-    return true
+    for M in (current_pt.invCholeskyX, current_pt.invCholeskyZ, current_pt.invzMat)
+        _finite_blocks(M) || return _NONFINITE_STEP
+    end
+    return nothing
 end
