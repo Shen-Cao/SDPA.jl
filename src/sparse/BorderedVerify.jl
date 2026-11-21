@@ -41,12 +41,19 @@ function _BorderedVerifier(::Type{T}, nrows::Int, dim::Int) where {T}
     # Guard precision controls the tightness, not validity, of the bounds.
     guard = Base.checked_add(Base.checked_mul(p, 2), 64)
     return setprecision(BigFloat, guard) do
+        tolerance = zero(BigFloat)
+        working_eps = ldexp(one(BigFloat), 1 - p)
+        # Even the represented tolerance must be conservative: the
+        # mathematical square root need not be representable at guard p.
+        ccall((:mpfr_sqrt, Base.MPFR.libmpfr), Cint,
+              (Ref{BigFloat}, Ref{BigFloat}, _BV_Round),
+              tolerance, working_eps, _BV_DOWN)
         _BorderedVerifier(
             _independent_zeros(BigFloat, nrows), _independent_zeros(BigFloat, nrows),
             _independent_zeros(BigFloat, dim, dim), _independent_zeros(BigFloat, dim, dim),
             _independent_zeros(BigFloat, dim, dim), _independent_zeros(BigFloat, dim, dim),
             _independent_zeros(BigFloat, 2), _independent_zeros(BigFloat, 2), zero(BigFloat),
-            sqrt(ldexp(one(BigFloat), 1 - p)), # sqrt(eps of the working type)
+            tolerance,
         )
     end
 end

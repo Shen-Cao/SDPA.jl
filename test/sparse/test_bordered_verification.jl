@@ -89,3 +89,26 @@ end
     end
     @test_throws "exceeds 1000000 guard-precision slots" SDPA._bordered_verify_slots(100,500)
 end
+
+@testset "verifier acceptance target is rounded inward" begin
+    for p in (128,224,384)
+        setprecision(BigFloat,p) do
+            v = SDPA._BorderedVerifier(BigFloat,2,0)
+            rounded_to_nearest = setprecision(BigFloat,precision(v.tol)) do
+                sqrt(ldexp(one(BigFloat),1-p))
+            end
+            # Here nearest is greater than the mathematical square root.
+            # The original action's first component equals the recorded
+            # coefficient exactly, while its RHS component is zero.
+            @test v.tol < rounded_to_nearest
+            V = reshape([rounded_to_nearest,one(BigFloat)],2,1)
+            data = _verification_gram_problem(BigFloat,V)
+            pt = SDPA.SDPASolution{BigFloat}(2,data.blockStruct,one(BigFloat))
+            x = g = BigFloat[0,1]
+            inc = SDPA._bordered_incidence(data)
+            @test !SDPA._verify_bordered_direction!(v,inc,data,pt,x,g)
+            SDPA.setelement_lp!(data.A[1],1,v.tol)
+            @test SDPA._verify_bordered_direction!(v,inc,data,pt,x,g)
+        end
+    end
+end
