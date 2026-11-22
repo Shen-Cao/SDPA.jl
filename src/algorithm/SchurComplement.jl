@@ -482,6 +482,139 @@ function cal_f3!(
     return s
 end
 
+# Only the counted prefix is active. Some explicit callers retain unused
+# capacity/trailing entries in the lists (including an inactive block).
+function _active_sdp_incidence_count(problem::SDPAProblem, l::Int)
+    n = problem.SDP_nConstraint[l]
+    0 <= n <= min(length(problem.SDP_constraint[l]), length(problem.SDP_blockIndex[l])) ||
+        throw(ArgumentError("invalid active SDP incidence count $n for block $l"))
+    return n
+end
+
+@inline function _checked_sdp_incidence_key(problem::SDPAProblem, l::Int, k::Int, n::Int)
+    i = problem.SDP_constraint[l][k]
+    1 <= i <= problem.m ||
+        throw(ArgumentError("invalid SDP constraint ID $i in block $l"))
+    ib = problem.SDP_blockIndex[l][k]
+    Ai = problem.A[i]
+    if !(1 <= ib <= Ai.SDP_sp_nBlock && isassigned(Ai.SDP_sp_block, ib) &&
+         checkbounds(Bool, Ai.SDP_sp_index, ib) && Ai.SDP_sp_index[ib] == l)
+        throw(ArgumentError("invalid SDP block index $ib for constraint $i in block $l"))
+    end
+    block = Ai.SDP_sp_block[ib]
+    (block.nRow == n && block.nCol == n) ||
+        throw(ArgumentError("invalid SDP dimensions for constraint $i in block $l"))
+    weight = block.nonZeroEffect
+    weight >= 0 || throw(ArgumentError("negative SDP weight for constraint $i in block $l"))
+    return (weight, i)
+end
+
+@inline function _add_sdp_formula_prefix!(counts::Vector{Int}, prefix::Int, i::Int, weight::Int, l::Int)
+    counts[i] == -1 || throw(ArgumentError("duplicate SDP constraint ID $i in block $l"))
+    prefix = Base.checked_add(prefix, weight)
+    counts[i] = prefix
+    return prefix
+end
+
+function _sdp_formula_prefix!(
+    counts::Vector{Int}, keys::Union{Nothing,Vector{Tuple{Int,Int}}},
+    problem::SDPAProblem, l::Int, n::Int, active::Int,
+)
+    # Each active ID gets a sentinel before any prefix is written. This
+    # detects duplicate IDs even when their weights differ, without
+    # clearing an m-entry scratch array for each small/disconnected block.
+    ordered = true
+    previous = (-1, 0)
+    for k in 1:active
+        key = _checked_sdp_incidence_key(problem, l, k, n)
+        counts[key[2]] = -1
+        ordered &= !isless(key, previous)
+        previous = key
+    end
+
+    # The old scan counted the weights of all *strictly* smaller keys
+    # plus this key's own weight. Keys with unique IDs form a total
+    # order even when weights tie. Do not sort/mutate the incidence lists.
+    cs = problem.SDP_constraint[l]
+    bs = problem.SDP_blockIndex[l]
+    prefix = 0
+    if ordered
+        # Typical equal-weight lists already arrive in constraint-ID order.
+        for k in 1:active
+            i = cs[k]
+            weight = problem.A[i].SDP_sp_block[bs[k]].nonZeroEffect
+            prefix = _add_sdp_formula_prefix!(counts, prefix, i, weight, l)
+        end
+    else
+        scratch = keys === nothing ? Tuple{Int,Int}[] : keys
+        resize!(scratch, active)
+        for k in 1:active
+            i = cs[k]
+            scratch[k] = (problem.A[i].SDP_sp_block[bs[k]].nonZeroEffect, i)
+        end
+        sort!(scratch; alg=Base.Sort.MergeSort)
+        for (weight, i) in scratch
+            prefix = _add_sdp_formula_prefix!(counts, prefix, i, weight, l)
+        end
+        keys = scratch
+    end
+    return keys
+end
+
+@inline function _sdp_formula_dimensions(n::I) where {I<:_SchurIndexWidth}
+    n >= 0 || throw(ArgumentError("negative SDP dimension $n"))
+    square, square_overflow = Base.mul_with_overflow(n, n)
+    if !square_overflow
+        cube, cube_overflow = Base.mul_with_overflow(square, n)
+        # The cube is a cost estimate, not a native storage or indexing
+        # limit. Keep the original native type whenever it fits: MPFR's
+        # BigFloat + Int adds the integer directly, even at low precision.
+        cube_overflow || return square, cube
+        return square, Base.checked_mul(widen(square), widen(n))
+    end
+    wide_n = widen(n)
+    wide_square = Base.checked_mul(wide_n, wide_n)
+    return wide_square, Base.checked_mul(wide_square, wide_n)
+end
+
+# Dispatch once per block on the integer cost widths, not once per entry.
+function _select_sdp_formulas!(
+    newton_state::NewtonState{T}, problem::SDPAProblem{T}, l::Int,
+    nconstr_l::Int, kappa::T, n::Int, n²::Integer, n³::Integer,
+) where {T<:Real}
+    up_counts = newton_state._up_counts_scratch
+    # Keep cost arithmetic, tie policy, and writes in the original order.
+    for k1 in 1:nconstr_l
+        i = problem.SDP_constraint[l][k1]
+        ib = problem.SDP_blockIndex[l][k1]
+        Ai_block = problem.A[i].SDP_sp_block[ib]
+        inz = Ai_block.nonZeroEffect
+        up = T(up_counts[i])
+
+        f1 = kappa * n * inz + n³ + kappa * up
+        f2 = kappa * n * inz + kappa * (n + 1) * up
+        f3 = (2 * kappa * inz + 1) * up
+
+        if Ai_block.type === :dense || inz >= n²
+            # Both operands of F3 must be sparse. Ordinarily a dense
+            # block owns every dense/sparse pair because its weight is
+            # the full slot count. A manually assembled sparse block
+            # with repeated triplets may match or exceed that weight.
+            newton_state.useFormula[i, l] = (f1 < f2) ? :F1 : :F2
+        else
+            # SPARSE: min of {f1, f2, f3}.
+            if f1 < f2 && f1 < f3
+                newton_state.useFormula[i, l] = :F1
+            elseif f2 < f3
+                newton_state.useFormula[i, l] = :F2
+            else
+                newton_state.useFormula[i, l] = :F3
+            end
+        end
+    end
+    return nothing
+end
+
 """
     compute_formula!(newton_state, problem, kappa=KAPPA_FORMULA)
 
@@ -501,68 +634,31 @@ Selection:
   - If A_i block is DENSE: use F1 if f1 < f2, else F2. NEVER F3.
   - If A_i block is SPARSE: use the min of {f1, f2, f3}, unless its
     triplet count can cause it to own a pair with a dense neighbor.
+
+Each active SDP block-incidence list must have distinct original constraint
+IDs. This is separate from coordinate entries within an individual matrix,
+whose triplet counts are used as stored.
 """
 function compute_formula!(
     newton_state::NewtonState{T}, problem::SDPAProblem{T};
     kappa::T=T(KAPPA_FORMULA),
 ) where {T<:Real}
-    m = problem.m
     fill!(newton_state.useFormula, :F1)
+    up_counts = newton_state._up_counts_scratch
+    keys = nothing
 
     for l in 1:problem.nBlock
-        problem.blockStruct[l] >= 2 || continue
-        nconstr_l = problem.SDP_nConstraint[l]
+        n = problem.blockStruct[l]
+        n >= 2 || continue
+        nconstr_l = _active_sdp_incidence_count(problem, l)
         nconstr_l == 0 && continue
 
-        # Compute upNonZeroCount for each constraint touching block l
-        # (reusing the pre-allocated scratch, one array per call).
-        up_counts = newton_state._up_counts_scratch
-        for k1 in 1:nconstr_l
-            i = problem.SDP_constraint[l][k1]
-            ib = problem.SDP_blockIndex[l][k1]
-            inz = problem.A[i].SDP_sp_block[ib].nonZeroEffect
-            up = inz
-            for k2 in 1:nconstr_l
-                j = problem.SDP_constraint[l][k2]
-                jb = problem.SDP_blockIndex[l][k2]
-                jnz = problem.A[j].SDP_sp_block[jb].nonZeroEffect
-                if jnz < inz || (jnz == inz && j < i)
-                    up += jnz
-                end
-            end
-            up_counts[i] = up
-        end
-
-        # Select formula per constraint.
-        for k1 in 1:nconstr_l
-            i = problem.SDP_constraint[l][k1]
-            ib = problem.SDP_blockIndex[l][k1]
-            Ai_block = problem.A[i].SDP_sp_block[ib]
-            inz = Ai_block.nonZeroEffect
-            n = Ai_block.nRow
-            up = T(up_counts[i])
-
-            f1 = kappa * n * inz + n * n * n + kappa * up
-            f2 = kappa * n * inz + kappa * (n + 1) * up
-            f3 = (2 * kappa * inz + 1) * up
-
-            if Ai_block.type === :dense || inz >= n * Ai_block.nCol
-                # Both operands of F3 must be sparse. Ordinarily a dense
-                # block owns every dense/sparse pair because its weight is
-                # the full slot count. A manually assembled sparse block
-                # with repeated triplets may match or exceed that weight.
-                newton_state.useFormula[i, l] = (f1 < f2) ? :F1 : :F2
-            else
-                # SPARSE: min of {f1, f2, f3}.
-                if f1 < f2 && f1 < f3
-                    newton_state.useFormula[i, l] = :F1
-                elseif f2 < f3
-                    newton_state.useFormula[i, l] = :F2
-                else
-                    newton_state.useFormula[i, l] = :F3
-                end
-            end
-        end
+        keys = _sdp_formula_prefix!(up_counts, keys, problem, l, n, nconstr_l)
+        n², cube = _sdp_formula_dimensions(n)
+        # A BigInt also has an exact-integer MPFR addition (mpfr_add_z);
+        # a widened machine integer can otherwise be rounded *before* add.
+        n³ = T === BigFloat && !(cube isa Int) ? BigInt(cube) : cube
+        _select_sdp_formulas!(newton_state, problem, l, nconstr_l, kappa, n, n², n³)
     end
     _check_no_F3_on_dense!(problem, newton_state)
     return newton_state
@@ -1571,6 +1667,34 @@ end
     return _binary_search_column(mat, offsets, i, j)
 end
 
+@inline function _checked_sdp_pair_count(n::I) where {I<:_SchurIndexWidth}
+    count = _schur_triangle_slots(n)
+    count <= typemax(I) ||
+        throw(OverflowError("SDP pair count for $n valid incidences does not fit $I"))
+    return I(count)
+end
+
+# The exact triangle identity needs distinct IDs, not just sorted weights.
+# Table construction can be called without running compute_formula! first,
+# and callers may have permuted or edited the active lists since then.
+function _sdp_pair_count!(
+    marks::Vector{Int}, problem::SDPAProblem, l::Int, active::Int,
+)
+    n = problem.blockStruct[l]
+    n >= 2 || throw(ArgumentError("non-SDP block $l has active SDP incidences"))
+    for k in 1:active
+        _, i = _checked_sdp_incidence_key(problem, l, k, n)
+        marks[i] = 0
+    end
+    cs = problem.SDP_constraint[l]
+    for k in 1:active
+        i = cs[k]
+        iszero(marks[i]) || throw(ArgumentError("duplicate SDP constraint ID $i in block $l"))
+        marks[i] = 1
+    end
+    return _checked_sdp_pair_count(active)
+end
+
 """
     make_aggrigate_index_sdp!(newton_state, problem, ordering)
 
@@ -1580,6 +1704,7 @@ Pre-condition: `newton_state.sparse_bmat` contains a closed profile from
 the block-level skyline. With an explicit-coordinate test or compatibility
 matrix, the caller must also set `newton_state.diagonalIndex`. Symbolic
 locations do not depend on the numeric values.
+The counted incidence prefix must contain distinct original constraint IDs.
 
 Post-condition: the 5 location-table arrays are populated; the table
 covers every (i, j, block_l) triple where both i and j have nonzeros in
@@ -1625,29 +1750,14 @@ function make_aggrigate_index_sdp!(
     # pre-sizing avoids the 2×-growth reallocations of `push!`
     # (C++ pre-allocates (n+1)*n/2 per block, sdpa_newton.cpp:415).
     for l in 1:nblocks
-        nC_l = problem.SDP_nConstraint[l]
+        nC_l = _active_sdp_incidence_count(problem, l)
         nC_l == 0 && continue
-        # Exact kept-pair count for this block: pairs (k1,k2) passing the
-        # (inz<jnz) || (inz==jnz && i<j) skip. For uniform nonZeroEffect
-        # this is exactly nC_l*(nC_l+1)/2; computed exactly rather than
-        # assumed.
-        cs_l = problem.SDP_constraint[l]
-        kept = 0
-        for k1 in 1:nC_l
-            i = cs_l[k1]
-            ib = problem.SDP_blockIndex[l][k1]
-            inz = problem.A[i].SDP_sp_block[ib].nonZeroEffect
-            for k2 in 1:nC_l
-                j = cs_l[k2]
-                jb = problem.SDP_blockIndex[l][k2]
-                jnz = problem.A[j].SDP_sp_block[jb].nonZeroEffect
-                (inz < jnz) && continue
-                (inz == jnz && i < j) && continue
-                kept += 1
-            end
-        end
+        # The predicate always keeps the diagonal and exactly one direction
+        # of each off-diagonal pair under the total order (nz, original ID).
+        kept = _sdp_pair_count!(newton_state._up_counts_scratch, problem, l, nC_l)
         n_start = length(newton_state.SDP_constraint1)
-        n_end = n_start + kept
+        n_end = Base.checked_add(n_start, kept)
+        Base.checked_mul(n_end, sizeof(Int))  # byte count of each of the five vectors
         # Exact pre-size (the 5 arrays all grow in lockstep).
         sizehint!(newton_state.SDP_constraint1, n_end)
         sizehint!(newton_state.SDP_constraint2, n_end)
@@ -1655,7 +1765,6 @@ function make_aggrigate_index_sdp!(
         sizehint!(newton_state.blockIndex2, n_end)
         sizehint!(newton_state.SDP_location_sparse_bMat, n_end)
 
-        count_this_block = 0
         for k1 in 1:nC_l
             i = problem.SDP_constraint[l][k1]
             ib = problem.SDP_blockIndex[l][k1]
@@ -1681,10 +1790,10 @@ function make_aggrigate_index_sdp!(
                 push!(newton_state.blockIndex1, ib)
                 push!(newton_state.blockIndex2, jb)
                 push!(newton_state.SDP_location_sparse_bMat, t)
-                count_this_block += 1
             end
         end
-        newton_state.SDP_block_table_len[l] = count_this_block
+        @assert length(newton_state.SDP_constraint1) == n_end
+        newton_state.SDP_block_table_len[l] = kept
     end
 
     return newton_state
