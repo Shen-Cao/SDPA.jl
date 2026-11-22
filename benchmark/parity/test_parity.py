@@ -11,7 +11,7 @@ from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
 
-from run import REPO, assess, child_environment, cpu_set, parameter_text, run_child
+from run import REPO, assess, child_environment, cpu_set, julia_route, parameter_text, run_child
 from witness import Inconclusive, Invalid, MAX_DECIMAL_DIGITS, cone_gate, read_problem, read_witness, validate
 
 
@@ -265,6 +265,45 @@ yMat =
             self.assertEqual(julia["OMP_PROC_BIND"], "FALSE")
             self.assertNotIn("OMP_PLACES", julia)
             self.assertNotIn("GOMP_CPU_AFFINITY", cpp)
+
+
+class JuliaRoute(unittest.TestCase):
+    """Route attribution must survive the messages solve! actually emits."""
+
+    def route_for(self, text):
+        with tempfile.TemporaryDirectory() as t:
+            log = Path(t) / "stderr.log"
+            log.write_text(text, encoding="utf-8")
+            return julia_route(log)
+
+    def test_forced_sparse_wins_over_the_density_veto(self):
+        # SDPA_FORCE_SPARSE_PROFILE=1 logs the density-veto line first and
+        # the FORCED override second; both appear in one stderr stream.
+        # The override is definitive, so the run must be reported sparse.
+        self.assertEqual(self.route_for(
+            "[ Info: Block-level skyline: 5050 entries (density=100.0%)\n"
+            "[ Info: Block-level density >25% — using dense path "
+            "(F1/F2/F3 couple all constraints within blocks)\n"
+            "[ Info: FORCED sparse profile (SDPA_FORCE_SPARSE_PROFILE=1): "
+            "5050 entries (density=100%)\n"), "sparse")
+
+    def test_dense_path_and_late_density_veto_report_dense(self):
+        self.assertEqual(
+            self.route_for("[ Info: Using dense Schur complement path\n"),
+            "dense")
+        # The opening sparse message is tentative; a later veto is final.
+        self.assertEqual(self.route_for(
+            "[ Info: Using sparse Schur complement path (m=100)\n"
+            "[ Info: Block-level density >25% — using dense path "
+            "(F1/F2/F3 couple all constraints within blocks)\n"), "dense")
+
+    def test_plain_sparse_profile_and_no_markers(self):
+        self.assertEqual(self.route_for(
+            "[ Info: Block-level profile: 100 entries (density=12.34%)\n"),
+            "sparse")
+        self.assertEqual(self.route_for(""), "unobserved")
+        self.assertEqual(self.route_for("[ Info: unrelated output\n"),
+                         "unobserved")
 
 
 @unittest.skipUnless(sys.platform == "linux" and hasattr(os, "pidfd_open") and shutil.which("cc"),

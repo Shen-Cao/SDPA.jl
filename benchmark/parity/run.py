@@ -211,10 +211,15 @@ def run_child(measure, command, directory, env, cpus, timeout):
 def julia_route(stderr):
     # 'Using sparse Schur complement path' is tentative: a later density
     # veto can still choose dense. Do not treat that first message as final.
+    # A forced-sparse run (SDPA_FORCE_SPARSE_PROFILE=1) also logs the
+    # density-veto line before the FORCED line, so the override must be
+    # decided before any dense-veto string can misattribute the run.
     text = stderr.read_text(encoding="utf-8")
+    if "FORCED sparse profile" in text:
+        return "sparse"
     if "Using dense Schur complement path" in text or "Block-level density >25%" in text:
         return "dense"
-    if "Block-level profile:" in text or "FORCED sparse profile" in text:
+    if "Block-level profile:" in text:
         return "sparse"
     return "unobserved"
 
