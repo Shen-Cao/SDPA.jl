@@ -57,12 +57,14 @@ and the actual sparse profile:
 
 ```julia
 block_skyline = build_skyline_from_problem!(problem, ordering, reverse_ordering)
-sparse_bmat, diagonalIndex = profile_from_skyline!(block_skyline, T)
+sparse_bmat = _SchurSkyline{T}(block_skyline)
 ```
 
 `make_aggrigate_index_sdp!` then ERRORS on any block-level pair outside
-the profile (an `@assert`, mirroring the C++ "program bug" at
-`sdpa_newton.cpp:481`). It never silently drops entries.
+the profile (an `error` through `_schur_assembly_slot`, mirroring the
+C++ "program bug" at `sdpa_newton.cpp:481`). It never silently drops
+entries. The explicit-coordinate `profile_from_skyline!` form and its
+`diagonalIndex` output remain available on the compatibility path.
 
 ### Position-Level (approximation, retained for ordering)
 
@@ -216,12 +218,13 @@ is no adjustment fallback on either path.
 For each SDP block l, it iterates ALL constraint pairs (k1, k2) within
 that block and checks:
 1. Upper-triangle skip (inz < jnz or tie-break)
-2. **Skyline coverage**: `@assert jj <= ii + col_height - 1` (every
-   block-level pair MUST be covered by the profile). A pair outside it
-   means the profile was built from a position-level skyline (a
-   truncated Schur matrix); C++ treats this as a fatal "program bug"
-   (`sdpa_newton.cpp:481`), and so do we. The assert can never fire once
-   solve.jl builds the profile from the block-level skyline.
+2. **Skyline coverage**: `error()` via `_schur_assembly_slot` unless
+   `jj <= ii + col_height - 1` (every block-level pair MUST be covered
+   by the profile). A pair outside it means the profile was built from a
+   position-level skyline (a truncated Schur matrix); C++ treats this as
+   a fatal "program bug" (`sdpa_newton.cpp:481`), and so do we. The
+   error can never fire once solve.jl builds the profile from the
+   block-level skyline.
 
 Pairs passing both checks are stored in 5 parallel arrays:
 - `SDP_constraint1[k]`, `SDP_constraint2[k]`: constraint indices i, j
@@ -403,7 +406,7 @@ pivot, not an approximation artifact). Try:
    fallback)
 
 A `block-level pair (ii=..., jj=...) outside block-level profile`
-assertion instead means the profile was NOT built from the block-level
+error instead means the profile was NOT built from the block-level
 skyline (programming error; C++ "program bug" parity at
 `sdpa_newton.cpp:481`).
 

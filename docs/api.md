@@ -107,8 +107,8 @@ Internal state for one Newton iteration. Not typically accessed by
 users, but available for advanced use:
 
 - `bmat::SDPADenseMatrix{T}` — dense Schur complement matrix
-- `sparse_bmat::Union{Nothing,SDPASparseMatrix{T}}` — profile-form sparse Schur
-- `diagonalIndex::Vector{Int}` — column pointers for profile form
+- `sparse_bmat::Union{Nothing,SDPASparseMatrix{T},_SchurSkyline{T}}` — profile-form sparse Schur; production solves store `_SchurSkyline{T}` (values plus checked interval offsets), while the explicit-coordinate `SDPASparseMatrix{T}` form remains the compatibility path
+- `diagonalIndex::Vector{Int}` — column pointers for the explicit-coordinate compatibility form only; `_SchurSkyline` carries its own offsets
 - `ordering::Vector{Int}` — AMD/METIS permutation
 - `use_sparse::Bool` — dispatch flag
 - Location-table arrays: `SDP_constraint1`, `SDP_constraint2`, `blockIndex1`, `blockIndex2`, `SDP_location_sparse_bMat`

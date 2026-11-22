@@ -736,8 +736,9 @@ function _solve_inner_locked!(
                 # `block_skyline` used for the density gate above (F1). This
                 # covers every block-level (i,j) pair that
                 # make_aggrigate_index_sdp! emits (C++ Chordal::makeGraph
-                # connectivity, sdpa_chordal.cpp:141-211), so the F1 @assert
-                # inside it can never fire. A position-level skyline would
+                # connectivity, sdpa_chordal.cpp:141-211), so the pair-range
+                # `error` inside it (`_schur_assembly_slot`) can never fire. A
+                # position-level skyline would
                 # truncate the Schur matrix (it misses block-level pairs).
                 if verbose
                     @info "Block-level profile: $block_profile_nnz entries " *
