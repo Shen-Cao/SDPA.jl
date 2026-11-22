@@ -901,18 +901,18 @@ than a dense `LP_sp_nBlock × m²` scan. The iteration order (lp_k
 ascending, then (i,j) lexicographic) is identical to the dense path, so
 accumulation is bit-identical.
 
-Uses binary search to find the profile position (same as SDP path).
+Uses the same checked profile addressing as SDP assembly.
 """
 function _compute_bmat_sparse_lp!(
     newton_state::NewtonState{T}, problem::SDPAProblem{T},
     current_pt::SDPASolution{T},
 ) where {T<:Real}
-    sparse_bmat = newton_state.sparse_bmat
-    diagonalIndex = newton_state.diagonalIndex
-    reverse_ordering = newton_state.reverse_ordering
-
     lp_n = current_pt.xMat.LP_nBlock
     lp_n == 0 && return newton_state
+    sparse_bmat = newton_state.sparse_bmat
+    sparse_bmat === nothing && error("sparse Schur matrix is not allocated")
+    diagonalIndex = _schur_offsets(sparse_bmat, newton_state.diagonalIndex)
+    reverse_ordering = newton_state.reverse_ordering
     clists = _lp_constraint_lists!(newton_state, problem)
 
     for lp_k in 1:lp_n
@@ -935,23 +935,7 @@ function _compute_bmat_sparse_lp!(
                 ii = min(p_i, p_j)
                 jj = max(p_i, p_j)
 
-                # Skyline check: every LP pair must be covered by the
-                # sparse profile. The block-level skyline merges the LP
-                # constraint lists (C++ Chordal::makeGraph,
-                # sdpa_chordal.cpp:204-211), so a pair outside the
-                # profile means the profile was built without the LP
-                # merge — a TRUNCATED Schur matrix. C++ treats this as
-                # a fatal "program bug" (sdpa_newton.cpp:677); so do we
-                # (same contract as the SDP-side assert in
-                # make_aggrigate_index_sdp!). Must never fire once the
-                # profile is built from the block-level skyline
-                # (solve.jl).
-                col_height = diagonalIndex[ii + 1] - diagonalIndex[ii]
-                jj <= ii + col_height - 1 ||
-                    error("LP pair (ii=$ii, jj=$jj) outside block-level profile")
-
-                # Binary search for position in sp_ele
-                loc = _binary_search_column(sparse_bmat, diagonalIndex, ii, jj)
+                loc = _schur_assembly_slot(sparse_bmat, diagonalIndex, ii, jj, "LP")
                 val = xz_inv * ai * aj
 
                 if T <: BigFloat
@@ -993,12 +977,12 @@ function threaded_compute_bmat_sparse_lp!(
     newton_state::NewtonState{T}, problem::SDPAProblem{T},
     current_pt::SDPASolution{T},
 ) where {T<:Real}
-    sparse_bmat = newton_state.sparse_bmat
-    diagonalIndex = newton_state.diagonalIndex
-    reverse_ordering = newton_state.reverse_ordering
-
     lp_n = current_pt.xMat.LP_nBlock
     lp_n == 0 && return newton_state
+    sparse_bmat = newton_state.sparse_bmat
+    sparse_bmat === nothing && error("sparse Schur matrix is not allocated")
+    diagonalIndex = _schur_offsets(sparse_bmat, newton_state.diagonalIndex)
+    reverse_ordering = newton_state.reverse_ordering
     clists = _lp_constraint_lists!(newton_state, problem)
 
     # Flat (lp_k, pair) layout: offsets[lp_k] is the first flat index
@@ -1054,13 +1038,7 @@ function threaded_compute_bmat_sparse_lp!(
                 ii = min(p_i, p_j)
                 jj = max(p_i, p_j)
 
-                # Skyline check: every LP pair must be covered by the
-                # sparse profile (same contract as the serial path).
-                col_height = diagonalIndex[ii + 1] - diagonalIndex[ii]
-                jj <= ii + col_height - 1 ||
-                    error("LP pair (ii=$ii, jj=$jj) outside block-level profile")
-
-                loc = _binary_search_column(sparse_bmat, diagonalIndex, ii, jj)
+                loc = _schur_assembly_slot(sparse_bmat, diagonalIndex, ii, jj, "LP")
                 flat += 1
                 lp_locations[flat] = loc
                 val = xz_inv * ai * aj
@@ -1578,15 +1556,30 @@ function _binary_search_column(
     error("_binary_search_column: column $jj not found in column $ii (called from make_aggrigate_index_sdp!, _compute_bmat_sparse_lp!, threaded_compute_bmat_sparse_lp!)")
 end
 
+# The explicit-coordinate compatibility path must still check actual
+# coordinates: a manually supplied matrix can have holes inside its range.
+@inline function _schur_assembly_slot(
+    mat::SDPASparseMatrix, offsets::Vector{Int}, i::Int, j::Int, context::String,
+)
+    # Same row-index guard as the compact form: a descriptive error, not
+    # a BoundsError from the offset reads below.
+    1 <= i <= length(offsets) - 1 ||
+        error("$context row index ii=$i outside block-level profile")
+    height = offsets[i + 1] - offsets[i]
+    i <= j && j - i < height ||
+        error("$context pair (ii=$i, jj=$j) outside block-level profile")
+    return _binary_search_column(mat, offsets, i, j)
+end
+
 """
     make_aggrigate_index_sdp!(newton_state, problem, ordering)
 
 Build the sparse Schur complement location table for SDP blocks.
 
-Pre-condition: `newton_state.sparse_bmat` and `newton_state.diagonalIndex`
-must already be populated (via `profile_from_skyline!` from the block-level
-skyline, or the full-profile construction on a zero or dummy dense bmat —
-the column_index pattern is independent of values).
+Pre-condition: `newton_state.sparse_bmat` contains a closed profile from
+the block-level skyline. With an explicit-coordinate test or compatibility
+matrix, the caller must also set `newton_state.diagonalIndex`. Symbolic
+locations do not depend on the numeric values.
 
 Post-condition: the 5 location-table arrays are populated; the table
 covers every (i, j, block_l) triple where both i and j have nonzeros in
@@ -1599,17 +1592,15 @@ function make_aggrigate_index_sdp!(
     newton_state::NewtonState{T}, problem::SDPAProblem{T},
     ordering::AbstractVector{<:Integer},
 ) where {T<:Real}
-    # Pre-condition checks.
-    newton_state.sparse_bmat !== nothing ||
-        error("make_aggrigate_index_sdp!: sparse_bmat must be populated first")
-    length(newton_state.diagonalIndex) == problem.m + 1 ||
-        error("make_aggrigate_index_sdp!: diagonalIndex length mismatch")
-    length(newton_state.reverse_ordering) == problem.m ||
-        error("make_aggrigate_index_sdp!: reverse_ordering length mismatch")
-
     sparse_bmat = newton_state.sparse_bmat
-    diagonalIndex = newton_state.diagonalIndex
+    sparse_bmat === nothing &&
+        error("make_aggrigate_index_sdp!: sparse_bmat must be populated first")
+    diagonalIndex = _schur_offsets(sparse_bmat, newton_state.diagonalIndex)
+    length(diagonalIndex) == problem.m + 1 ||
+        error("make_aggrigate_index_sdp!: diagonalIndex length mismatch")
     reverse_ordering = newton_state.reverse_ordering
+    length(reverse_ordering) == problem.m ||
+        error("make_aggrigate_index_sdp!: reverse_ordering length mismatch")
 
     # Reset the 5 arrays (in case this is a re-run on the same state).
     empty!(newton_state.SDP_constraint1)
@@ -1683,20 +1674,7 @@ function make_aggrigate_index_sdp!(
                 p_j = reverse_ordering[j]
                 ii, jj = p_i <= p_j ? (p_i, p_j) : (p_j, p_i)
 
-                # Skyline check: every block-level pair must be covered by
-                # the sparse profile. Column ii's skyline = ii +
-                # (diagonalIndex[ii+1] - diagonalIndex[ii]) - 1. A pair
-                # outside the profile means the profile was built from a
-                # position-level skyline — a TRUNCATED Schur matrix.
-                # C++ treats this as a fatal "program bug"
-                # (sdpa_newton.cpp:481); so do we. Must never fire once the
-                # profile is built from the block-level skyline (solve.jl).
-                col_height = diagonalIndex[ii + 1] - diagonalIndex[ii]
-                jj <= ii + col_height - 1 ||
-                    error("block-level pair (ii=$ii, jj=$jj) outside block-level profile")
-
-                # Binary-search column ii for entry with column-index jj.
-                t = _binary_search_column(sparse_bmat, diagonalIndex, ii, jj)
+                t = _schur_assembly_slot(sparse_bmat, diagonalIndex, ii, jj, "block-level")
 
                 push!(newton_state.SDP_constraint1, i)
                 push!(newton_state.SDP_constraint2, j)

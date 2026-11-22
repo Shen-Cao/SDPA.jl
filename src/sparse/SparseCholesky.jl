@@ -152,7 +152,7 @@ the zeroed diagonal become 0), so the factor state stays C++-parity; the
 caller aborts the factorization on `false`.
 """
 @inline function _sparse_cholesky_factor_range!(
-    mat::SDPASparseMatrix{T}, diagonalIndex::Vector{Int}, i::Int,
+    mat::Union{SDPASparseMatrix{T},_SchurSkyline{T}}, diagonalIndex::Vector{Int}, i::Int,
 ) where {T<:Real}
     indexA1 = diagonalIndex[i]
     indexA2 = diagonalIndex[i + 1]
@@ -184,6 +184,62 @@ caller aborts the factorization on `false`.
     return ok
 end
 
+# The shared scheduler sends the source column as well as its flat index.
+# For contiguous closed storage this makes source and destination addressing
+# arithmetic, with no searches or coordinate streams in the hot loops.
+@inline _profile_update!(mat::SDPASparseMatrix, di::Vector{Int}, ::Int, k::Int) =
+    _sparse_profile_update!(mat, di, k)
+
+@inline function _profile_update!(
+    mat::_SchurSkyline{T}, di::Vector{Int}, i::Int, k1::Int,
+) where {T<:Real}
+    values = mat.sp_ele
+    @inbounds begin
+        target = i + (k1 - di[i])
+        k3 = di[target]
+        tmp = values[k1]
+        # k1 is (i,target), so the tail maps to (target,target) onward.
+        # Closed reaches guarantee the entire tail fits in target's range.
+        for k2 in k1:(di[i + 1] - 1)
+            if T <: BigFloat
+                mp_sub_mul!(values[k3], tmp, values[k2])
+            else
+                values[k3] -= tmp * values[k2]
+            end
+            k3 += 1
+        end
+    end
+    return nothing
+end
+
+@inline _profile_reach(::_SchurSkyline, di::Vector{Int}, i::Int, a2::Int) =
+    i + (a2 - di[i])
+@inline _profile_reach(mat::SDPASparseMatrix, ::Vector{Int}, ::Int, a2::Int) =
+    mat.column_index[a2]
+
+@inline function _profile_target_slice(
+    mat::SDPASparseMatrix, ::Vector{Int}, i::Int, first::Int, last::Int,
+    a1::Int, a2::Int,
+)
+    cols = mat.column_index
+    lo = first == i + 1 ? a1 : searchsortedfirst(cols, first, a1, a2, Base.Order.Forward)
+    hi = searchsortedlast(cols, last, a1, a2, Base.Order.Forward)
+    return lo:hi
+end
+
+@inline function _profile_target_slice(
+    mat::_SchurSkyline, di::Vector{Int}, i::Int, first::Int, last::Int,
+    ::Int, a2::Int,
+)
+    lo = max(i + 1, first)
+    hi = min(_profile_reach(mat, di, i, a2), last)
+    lo <= hi || return 1:0
+    # Clip the target endpoints BEFORE adding: di[i] + a row offset
+    # beyond the end of this source would not necessarily fit in Int.
+    base = di[i]
+    return (base + (lo - i)):(base + (hi - i))
+end
+
 """
     _sparse_cholesky_deferred_block!(mat, diagonalIndex, c1, c2, t0, nb, nDIM)
 
@@ -194,21 +250,16 @@ accumulation order (bit-identity).  Different `t0` touch disjoint target
 block-columns, so concurrent calls are race-free.
 """
 function _sparse_cholesky_deferred_block!(
-    mat::SDPASparseMatrix{T}, diagonalIndex::Vector{Int},
+    mat, diagonalIndex::Vector{Int},
     c1::Int, c2::Int, t0::Int, nb::Int, nDIM::Int,
-) where {T<:Real}
-    tend = min(t0 + nb - 1, nDIM)
-    column_index = mat.column_index
+)
+    tend = t0 + min(nb - 1, nDIM - t0)
     @inbounds for i in c1:c2
         a1 = diagonalIndex[i] + 1
         a2 = diagonalIndex[i + 1] - 1
         if a1 <= a2
-            # Source range i's sub-diagonal entries are sorted by target
-            # column, so the entries targeting [t0, tend] form a slice.
-            lo = searchsortedfirst(column_index, t0, a1, a2, Base.Order.Forward)
-            hi = searchsortedlast(column_index, tend, a1, a2, Base.Order.Forward)
-            for k1 in lo:hi
-                _sparse_profile_update!(mat, diagonalIndex, k1)
+            for k1 in _profile_target_slice(mat, diagonalIndex, i, t0, tend, a1, a2)
+                _profile_update!(mat, diagonalIndex, i, k1)
             end
         end
     end
@@ -216,19 +267,25 @@ function _sparse_cholesky_deferred_block!(
 end
 
 function sparse_cholesky!(
-    mat::SDPASparseMatrix{T}, diagonalIndex::Vector{Int}
-) where {T<:Real}
+    mat::SDPASparseMatrix, diagonalIndex::Vector{Int},
+)
     nDIM = mat.nRow
     @assert nDIM == mat.nCol "sparse_cholesky! requires square matrix"
     @assert length(diagonalIndex) == nDIM + 1 "diagonalIndex length must be nDIM+1"
+    return _factor_profile!(mat, diagonalIndex, nDIM)
+end
 
+function sparse_cholesky!(mat::_SchurSkyline)
+    return _factor_profile!(mat, mat.offsets, length(mat.offsets) - 1)
+end
+
+function _factor_profile!(mat, diagonalIndex::Vector{Int}, nDIM::Int)
     use_tasks = Threads.nthreads() > 1
     nb = _SPARSE_CHOLESKY_NB
-    column_index = mat.column_index
 
     c1 = 1
     while c1 <= nDIM
-        c2 = min(c1 + nb - 1, nDIM)
+        c2 = c1 + min(nb - 1, nDIM - c1)
         last_target = c2
 
         # Phase 1: factor each range of the block-column, applying its
@@ -240,17 +297,17 @@ function sparse_cholesky!(
             a2 = diagonalIndex[i + 1] - 1
             if a1 <= a2
                 # The last stored index is this column's maximum reach.
-                last_target = max(last_target, column_index[a2])
-                # Within-block targets form a prefix (sorted by column_index).
-                hi = searchsortedlast(column_index, c2, a1, a2, Base.Order.Forward)
-                if use_tasks && hi - a1 + 1 >= _SPARSE_CHOLESKY_PAR_MIN
-                    @tasks for k1 in a1:hi
+                last_target = max(last_target, _profile_reach(mat, diagonalIndex, i, a2))
+                # Within-block targets form a prefix of the source range.
+                targets = _profile_target_slice(mat, diagonalIndex, i, i + 1, c2, a1, a2)
+                if use_tasks && length(targets) >= _SPARSE_CHOLESKY_PAR_MIN
+                    @tasks for k1 in targets
                         @set split=:roundrobin
-                        _sparse_profile_update!(mat, diagonalIndex, k1)
+                        _profile_update!(mat, diagonalIndex, i, k1)
                     end
                 else
-                    for k1 in a1:hi
-                        _sparse_profile_update!(mat, diagonalIndex, k1)
+                    for k1 in targets
+                        _profile_update!(mat, diagonalIndex, i, k1)
                     end
                 end
             end
@@ -369,6 +426,65 @@ function solve_systems_sparse!(
     end
 
     return x
+end
+
+# Keep the same storage sweep as the explicit-reference solve: forward
+# diagonal then increasing rows; backward decreasing rows then diagonal.
+# In particular, don't fuse BigFloat multiply and subtraction here.
+function solve_systems_sparse!(
+    x::AbstractVector{T}, mat::_SchurSkyline{T}, b::AbstractVector{T},
+) where {T<:Real}
+    Base.require_one_based_indexing(x, b)
+    offsets = mat.offsets
+    values = mat.sp_ele
+    n = length(offsets) - 1
+    length(x) == length(b) == n ||
+        throw(DimensionMismatch("Schur solve requires two length-$n vectors"))
+    _copyto_independent!(x, b)
+    buf = zero(T)
+
+    @inbounds for i in 1:n
+        start = offsets[i]
+        _skyline_scale!(x, i, values[start], buf)
+        for k in (start + 1):(offsets[i + 1] - 1)
+            j = i + (k - start)
+            _skyline_subtract!(x, j, values[k], x[i], buf)
+        end
+    end
+    @inbounds for i in n:-1:1
+        start = offsets[i]
+        for k in (offsets[i + 1] - 1):-1:(start + 1)
+            j = i + (k - start)
+            _skyline_subtract!(x, i, values[k], x[j], buf)
+        end
+        _skyline_scale!(x, i, values[start], buf)
+    end
+    return x
+end
+
+Base.@propagate_inbounds function _skyline_scale!(
+    x::AbstractVector{T}, i::Int, value::T, buf::T,
+) where {T}
+    if T <: BigFloat
+        mp_mul!(buf, value, x[i])
+        mp_set!(x[i], buf)
+    else
+        x[i] *= value
+    end
+    return nothing
+end
+
+Base.@propagate_inbounds function _skyline_subtract!(
+    x::AbstractVector{T}, i::Int, a::T, b::T, buf::T,
+) where {T}
+    if T <: BigFloat
+        mp_mul!(buf, a, b)
+        mp_sub!(buf, x[i], buf)
+        mp_set!(x[i], buf)
+    else
+        x[i] -= a * b
+    end
+    return nothing
 end
 
 """

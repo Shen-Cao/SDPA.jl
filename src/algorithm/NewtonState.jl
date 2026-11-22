@@ -36,7 +36,7 @@ Fields
   until the predictor factorizes it (and on Cholesky failure).
 
 SOCP-related fields are skipped (C++ has them, we don't need them).
-Sparse-related fields (`sparse_bmat`, `diagonalIndex`, `ordering`,
+Sparse-related fields (`sparse_bmat`, `ordering`,
 `reverse_ordering`, `use_sparse`) ARE present in the struct as
 placeholder fields (initialized to `nothing` / `Int[]` / `false`).
 They are populated only when `analyze_sparsity` selects the sparse
@@ -53,7 +53,9 @@ mutable struct NewtonState{T<:Real}
     useFormula::Matrix{Symbol}
     cholesky_factorization::Union{Cholesky{T,Matrix{T}},Nothing}
     # Sparse Schur complement fields
-    sparse_bmat::Union{Nothing,SDPASparseMatrix{T}}
+    sparse_bmat::Union{Nothing,SDPASparseMatrix{T},_SchurSkyline{T}}
+    # Only used by explicit-coordinate callers. Production _SchurSkyline
+    # owns its validated offsets and does not duplicate them here.
     diagonalIndex::Vector{Int}
     ordering::Vector{Int}
     reverse_ordering::Vector{Int}

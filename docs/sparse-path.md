@@ -57,12 +57,14 @@ and the actual sparse profile:
 
 ```julia
 block_skyline = build_skyline_from_problem!(problem, ordering, reverse_ordering)
-sparse_bmat, diagonalIndex = profile_from_skyline!(block_skyline, T)
+sparse_bmat = _SchurSkyline{T}(block_skyline)
 ```
 
 `make_aggrigate_index_sdp!` then ERRORS on any block-level pair outside
-the profile (an `@assert`, mirroring the C++ "program bug" at
-`sdpa_newton.cpp:481`). It never silently drops entries.
+the profile (an `error` through `_schur_assembly_slot`, mirroring the
+C++ "program bug" at `sdpa_newton.cpp:481`). It never silently drops
+entries. The explicit-coordinate `profile_from_skyline!` form and its
+`diagonalIndex` output remain available on the compatibility path.
 
 ### Position-Level (approximation, retained for ordering)
 
@@ -136,11 +138,28 @@ sp_ele[diagonalIndex[j] + (i - j)] = B_perm[i, j]   for skyline[j] ≥ i ≥ j
 Each column j stores entries from the diagonal (row j) up to the skyline
 (furthest connected row). Entries outside the skyline are implicitly zero.
 
-**Storage cost**: profile_nnz × sizeof(T) bytes.
+Inside `solve!`, the closed profile owns only its numeric values and
+the `m + 1` offsets. There are no per-entry row or column index arrays.
+This removes two native-word integers per stored value compared with
+the explicit representation; a BigFloat value still owns its precision-
+dependent backing memory. Other costs, such as the SDP location table and
+threaded contribution buffers, are unchanged.
+
+Before allocating values, the solver checks that each column's reach is
+within `j:m`, that reaches are nondecreasing (fill-in closure), and that
+the one-past-the-end offset fits in an `Int`. Routing counts hypothetical
+slots in a widened integer and compares the density thresholds exactly;
+it does not allocate offsets or values for an envelope it will reject.
+Numeric assembly still
+rejects any required SDP or LP pair outside its column interval. The
+explicit-coordinate `SDPASparseMatrix`, `profile_from_skyline!`, and the
+factor/solve entry points taking explicit offsets remain available for
+reference and compatibility.
 
 ### Profile-Form Indexing Formula
 
-Verified against C++ `sdpa_newton.cpp:458-485`:
+The checked interval address used by the solver matches
+C++ `sdpa_newton.cpp:458-485`:
 
 ```
 For permuted indices (ii, jj) where ii = min(p_i, p_j), jj = max(p_i, p_j):
@@ -199,12 +218,13 @@ is no adjustment fallback on either path.
 For each SDP block l, it iterates ALL constraint pairs (k1, k2) within
 that block and checks:
 1. Upper-triangle skip (inz < jnz or tie-break)
-2. **Skyline coverage**: `@assert jj <= ii + col_height - 1` (every
-   block-level pair MUST be covered by the profile). A pair outside it
-   means the profile was built from a position-level skyline (a
-   truncated Schur matrix); C++ treats this as a fatal "program bug"
-   (`sdpa_newton.cpp:481`), and so do we. The assert can never fire once
-   solve.jl builds the profile from the block-level skyline.
+2. **Skyline coverage**: `error()` via `_schur_assembly_slot` unless
+   `jj <= ii + col_height - 1` (every block-level pair MUST be covered
+   by the profile). A pair outside it means the profile was built from a
+   position-level skyline (a truncated Schur matrix); C++ treats this as
+   a fatal "program bug" (`sdpa_newton.cpp:481`), and so do we. The
+   error can never fire once solve.jl builds the profile from the
+   block-level skyline.
 
 Pairs passing both checks are stored in 5 parallel arrays:
 - `SDP_constraint1[k]`, `SDP_constraint2[k]`: constraint indices i, j
@@ -386,7 +406,7 @@ pivot, not an approximation artifact). Try:
    fallback)
 
 A `block-level pair (ii=..., jj=...) outside block-level profile`
-assertion instead means the profile was NOT built from the block-level
+error instead means the profile was NOT built from the block-level
 skyline (programming error; C++ "program bug" parity at
 `sdpa_newton.cpp:481`).
 
