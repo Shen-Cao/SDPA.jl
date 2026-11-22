@@ -41,6 +41,11 @@ locally but does not establish a comparison against pinned source. Use only
 a trusted local executable. The runner rejects a build record whose SHA or
 binary/GMP/OpenMP digests disagree with the run.
 
+Residual risk: `build_cpp.py` is covered by static review only — the
+unittest suite does not invoke a C++ toolchain. The emitted `build.json`
+record and the runner's digest checks are the compensating controls; when
+they matter, prefer an upstream Autotools build and supply it via `--cpp`.
+
 `--project` lets you select a separate instantiated project/manifest, but the
 Julia worker rejects one that resolves SDPA.jl from a different checkout.
 Julia cache/depot setup is outside the timer. Use a new output path per run.
@@ -93,8 +98,9 @@ Both outputs are mapped to the **displayed SDPA convention**: minimize
 `<F_i,Y> = b_i` and `X,Y` in the PSD/LP cones. C++ natively prints
 `xVec=-internal y`, `xMat=internal Z`, and `yMat=internal X`. The Julia
 adapter emits that same sign and order. The C++ scalar summary is too
-short for verification, so the runner changes only output *formats* in
-the parameter file and parses the **timed run's** `xVec/xMat/yMat`.
+short for verification, so the runner changes only output *formats* plus
+the requested `maxIteration` and `precision` controls in the parameter
+file and parses the **timed run's** `xVec/xMat/yMat`.
 Precision-dependent formatting leaves generous guard digits; no
 untimed re-solve supplies an alternate witness.
 
