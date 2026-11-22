@@ -1561,6 +1561,10 @@ end
 @inline function _schur_assembly_slot(
     mat::SDPASparseMatrix, offsets::Vector{Int}, i::Int, j::Int, context::String,
 )
+    # Same row-index guard as the compact form: a descriptive error, not
+    # a BoundsError from the offset reads below.
+    1 <= i <= length(offsets) - 1 ||
+        error("$context row index ii=$i outside block-level profile")
     height = offsets[i + 1] - offsets[i]
     i <= j && j - i < height ||
         error("$context pair (ii=$i, jj=$j) outside block-level profile")

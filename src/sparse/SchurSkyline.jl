@@ -92,6 +92,10 @@ _SchurSkyline{T}(reaches::AbstractVector{Int}) where {T<:Real} =
 @inline function _schur_assembly_slot(
     ::_SchurSkyline, offsets::Vector{Int}, i::Int, j::Int, context::String,
 )
+    # Guard the row index first: an invalid ii must reach the descriptive
+    # error below rather than a raw BoundsError from the offset reads.
+    1 <= i <= length(offsets) - 1 ||
+        error("$context row index ii=$i outside block-level profile")
     start = offsets[i]
     i <= j && j - i < offsets[i + 1] - start ||
         error("$context pair (ii=$i, jj=$j) outside block-level profile")

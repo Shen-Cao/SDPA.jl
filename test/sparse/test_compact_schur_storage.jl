@@ -15,7 +15,15 @@ using Test
     @test_throws ErrorException SDPA._schur_assembly_slot(compact, compact.offsets, 2, 1, "LP")
     @test_throws ErrorException SDPA._schur_assembly_slot(compact, compact.offsets, 2, typemin(Int), "LP")
     @test_throws ErrorException SDPA._schur_assembly_slot(compact, compact.offsets, 2, typemax(Int), "LP")
-    @test_throws BoundsError SDPA._schur_assembly_slot(compact, compact.offsets, 0, 1, "LP")
+    # An invalid row index must reach the descriptive profile error, not
+    # a raw BoundsError from the offset reads.
+    @test_throws "LP row index ii=0 outside block-level profile" SDPA._schur_assembly_slot(
+        compact, compact.offsets, 0, 1, "LP")
+    @test_throws "LP row index ii=-1 outside block-level profile" SDPA._schur_assembly_slot(
+        compact, compact.offsets, -1, 1, "LP")
+    # offsets carries n+1 entries; n+1 addresses the sentinel, not a row.
+    @test_throws "LP row index ii=8 outside block-level profile" SDPA._schur_assembly_slot(
+        compact, compact.offsets, 8, 8, "LP")
 
     for reaches in ([0], [2], [1, 1], [3, 2, 3], [2, typemax(Int)], [typemin(Int)])
         @test_throws ArgumentError SDPA._SchurSkyline{Float64}(reaches)
@@ -131,6 +139,14 @@ end
         x = SDPA._independent_zeros(T, 4)
         SDPA.solve_systems_sparse!(x, mat, b, di)
         @test T[4 0 0 1; 0 4 0 0; 0 0 4 0; 1 0 0 4] * x ≈ b
+        # The explicit-coordinate form reports the same descriptive errors
+        # for an invalid row index and a pair beyond the column height.
+        @test_throws "LP row index ii=0 outside block-level profile" SDPA._schur_assembly_slot(
+            mat, di, 0, 1, "LP")
+        @test_throws "LP row index ii=5 outside block-level profile" SDPA._schur_assembly_slot(
+            mat, di, 5, 5, "LP")
+        @test_throws "LP pair (ii=1, jj=3) outside block-level profile" SDPA._schur_assembly_slot(
+            mat, di, 1, 3, "LP")
     end
 end
 
@@ -177,5 +193,31 @@ end
                 @test_throws "outside block-level profile" SDPA.make_aggrigate_index_sdp!(ns, p, ordering)
             end
         end
+    end
+end
+
+@testset "empty profile routing (m=0)" begin
+    # The storage testsets above already factor and solve the empty
+    # profile. Routing must handle m=0 without a special case: the
+    # density gate alone sends it dense (m < 100), and the only sparse
+    # entry, force_sparse, refuses it with a descriptive error before any
+    # Schur allocation.
+    @test SDPA._schur_route_slots(Int[]) == 0
+    @test SDPA._schur_triangle_slots(0) == 0
+    @test !SDPA._schur_density_exceeds(0, 0, 1, 4)
+    @test !SDPA._schur_density_exceeds(0, 0, 2, 5)
+    for T in (Float64, BigFloat)
+        # Negative LP objective direction: unbounded, so the constraint-
+        # free early exits fall through to the routing machinery.
+        C = SDPA.SDPASparseLinearSpace{T}(0, 1)
+        SDPA.setelement_lp!(C, 1, T(-1))
+        p = SDPA.SDPAProblem{T}(
+            0, 1, [-1], SDPA.SDPAVector{T}(0), C,
+            SDPA.SDPASparseLinearSpace{T}[])
+        SDPA.initialize_index!(p)
+        @test SDPA.analyze_sparsity(p)[1]
+        @test_throws r"force_sparse requires at least one constraint" SDPA.solve!(
+            p, SDPA.Parameters{T}(maxIteration=1);
+            force_sparse=true, io=devnull, reverse_primal_dual=false)
     end
 end
