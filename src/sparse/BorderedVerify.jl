@@ -134,6 +134,9 @@ end
 end
 
 function _bv_sdp!(v, entries, x, problem, X, Zinv)
+    # Exact gates, not tolerances: a non-finite or asymmetric X / Zinv
+    # (e.g. from an asymmetric warm start) declines the direction, which
+    # the solve reports as CHOLESKY_FAILURE at the last accepted iterate.
     all(isfinite, X) && all(isfinite, Zinv) &&
         issymmetric(X) && issymmetric(Zinv) || return false
     alo, ahi, blo, bhi = v.alo, v.ahi, v.blo, v.bhi

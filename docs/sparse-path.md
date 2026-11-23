@@ -478,8 +478,10 @@ and no expansion to a quadratic clique graph. Sparse coefficient blocks
 with duplicate coordinates (after normalizing mirrored positions) are
 declined rather than guessing their summed support. The experimental path
 requires 2–32 nonempty islands, at most 64 border rows and 64 original
-cone blocks, and Float64 or round-to-nearest BigFloat. It ignores the old
-ordering environment flags and is incompatible with `force_sparse=true`.
+cone blocks, and Float64 or round-to-nearest BigFloat. It neither reads
+nor validates the old ordering environment flags (an invalid value is
+reported only when the legacy route is taken) and is incompatible with
+`force_sparse=true`.
 
 For interior sizes `n_i` and border size `k`, the factor/panel cap
 (default 16,000,000 numeric slots) counts
@@ -487,7 +489,12 @@ For interior sizes `n_i` and border size `k`, the factor/panel cap
 linear scratch and incumbent solver workspaces, runtime overhead, or
 whole-process RSS. The border is allowed to be dense. A refused
 certificate or slot cap raises `ArgumentError` before any numerical
-Schur allocation. The route streams original SDP and LP contributions
+Schur allocation. The layout builder also refuses a partition whose
+factor/panel slots would not undercut the packed full triangle
+`m*(m+1)/2` ("no slot savings"). While at least two nonempty islands are
+required that refusal cannot fire — the saving is `sum_{i<j} n_i*n_j`,
+at least 1 — and it guards a future relaxation of the island rule. The
+route streams original SDP and LP contributions
 into their packed destinations; it does not allocate a legacy skyline,
 dense Schur matrix, location table, or per-pair contribution buffer.
 
@@ -513,10 +520,17 @@ rounded factor to validate the result. The entire resulting interval
 must fit within `sqrt(eps(working type)) * norm(rhs, Inf)` of that RHS;
 an exactly zero RHS instead requires an exactly zero direction. This is
 an additional direction acceptance check, not a change to IPM
-convergence tolerances. The check works at `2 * working_bits + 64` bits
-and reuses four largest-cone matrices plus two row endpoint vectors and
-six guard scalars. It adds time for the original action to both RHS
-solves, and can decline otherwise solvable but unresolved directions.
+convergence tolerances. The check needs an exactly symmetric `X` and
+`Z⁻¹` (`issymmetric`): an asymmetric warm start (`init`) or iterate is
+declined as `CHOLESKY_FAILURE` rather than symmetrized. The check works
+at `2 * working_bits + 64` bits and reuses four largest-cone matrices
+plus two row endpoint vectors and six guard scalars. That workspace is
+capped at 1,000,000 guard-precision slots, `4d^2 + 2m + 6` for the
+largest cone dimension `d` and `m` constraint rows, so the SDP cone
+dimension is at most 499 (and at that size at most 1,995 rows); a larger
+model raises `ArgumentError` before any numerical allocation. It adds
+time for the original action to both RHS solves, and can decline
+otherwise solvable but unresolved directions.
 Numerical failure returns `CHOLESKY_FAILURE` at the last accepted iterate
 without an unbounded retry. The different elimination order is not
 expected to be bit-identical to the legacy factor.

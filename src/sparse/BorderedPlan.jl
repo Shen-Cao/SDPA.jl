@@ -191,6 +191,9 @@ function _bordered_layout(labels::AbstractVector{Int}, max_slots::Int)
     end
     slots <= max_slots ||
         _bordered_refuse("requires $slots factor/panel slots; cap is $max_slots")
+    # Unreachable while at least two nonempty islands are required: the
+    # saving against the full triangle is sum_{i<j} n_i*n_j >= 1. The
+    # refusal guards a future relaxation of that island rule.
     slots < _schur_triangle_slots(m) ||
         _bordered_refuse("no slot savings versus the packed full triangle")
     order = sizehint!(Int[], m)

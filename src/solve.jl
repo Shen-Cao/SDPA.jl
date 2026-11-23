@@ -271,16 +271,23 @@ status).
 ## Experimental bordered Schur path
 `bordered_schur=true` requires a certified partition into at least two
 SDP-owned islands with a small border. It is supported for Float64 and
-nearest-rounded BigFloat. An uncertified partition or a factor/panel slot
-count above `bordered_max_slots` raises `ArgumentError` before materializing
+nearest-rounded BigFloat. An uncertified partition, a layout without a
+slot saving against the packed full triangle, or a factor/panel slot count
+above `bordered_max_slots` raises `ArgumentError` before materializing
 any Schur matrix. The default cap is 16,000,000 slots; the cap is not a
-total-process memory limit. This strict opt-in ignores legacy ordering
-environment knobs and is incompatible with `force_sparse=true` and with
-specifying a cap without opting in. Predictor and corrector directions
-must pass an independent outward-rounded check against the original
-Schur action. A separate cap bounds verification workspace. Numeric
-rejection returns the last accepted point with `CHOLESKY_FAILURE`;
-there is no legacy fallback. Defaults are unchanged.
+total-process memory limit. This strict opt-in neither reads nor validates
+the legacy ordering environment variables and is incompatible with
+`force_sparse=true` and with specifying a cap without opting in. Predictor
+and corrector directions must pass an independent outward-rounded check
+against the original Schur action. A direction is accepted only when the
+whole enclosure fits within `sqrt(eps(T)) * norm(rhs, Inf)`; that bound is
+a direction acceptance criterion, not an IPM convergence tolerance. The
+check needs an exactly symmetric `X` and `Z⁻¹`, so an asymmetric `init`
+or iterate is declined like any other numeric rejection. Its workspace is
+capped at 1,000,000 guard-precision slots (`4d^2 + 2m + 6`), i.e. an SDP
+cone dimension of at most 499. Numeric rejection returns the last accepted
+point with `CHOLESKY_FAILURE`; there is no legacy fallback. Defaults are
+unchanged.
 
 ## Precision contract
 - If `T == BigFloat`, the entire solve is wrapped in
@@ -448,6 +455,9 @@ function _solve_inner_locked!(
     bordered_slot_limit::Union{Nothing,Int}=nothing,
     _test_throw_after_blas::Bool=false,
 ) where {T<:Real}
+    # The bordered opt-in never reads the legacy ordering environment
+    # variables, so it does not validate them either: an invalid value is
+    # reported only when the legacy route is taken.
     bordered_slot_limit === nothing && _validate_sdpa_env_vars()
     # ---------------------------------------------------------------
     # 1. Allocate state (mirror C++ pinpal at sdpa_main.cpp:228-282).
