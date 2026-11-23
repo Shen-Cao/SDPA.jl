@@ -32,6 +32,7 @@ end
         @test L.sizes == [2, 2]
         @test L.border == 1
         @test L.slots == 11
+        @test L.slots < SDPA._schur_triangle_slots(p.m)
         @test L.order == [2, 4, 1, 5, 3]
         @test L.inverse == invperm(L.order)
         @test L.island_of == [2, 1, 0, 1, 2]
@@ -69,6 +70,16 @@ end
     @test_throws "border has 65 rows; limit is 64" SDPA._bordered_layout([1,2,zeros(Int,65)...],30000)
     @test_throws "expected 2 to 32" SDPA._bordered_layout(collect(1:33),100)
     @test_throws "expected 2 to 32" SDPA._bordered_layout([0,1,1,0],100)
+    # The builder refuses a layout with no slot saving against the packed
+    # full triangle. With the required >= 2 nonempty islands that refusal is
+    # unreachable: tri(sum n_i) - sum tri(n_i) = sum_{i<j} n_i*n_j >= 1. Pin
+    # the invariant it protects on every admissible partition of a small m.
+    for m in 2:7
+        admissible = (collect(Int, labels) for labels in Iterators.product(fill(0:3, m)...)
+                      if length(unique(filter(!iszero, labels))) >= 2)
+        @test all(SDPA._bordered_layout(labels, typemax(Int)).slots <
+                  SDPA._schur_triangle_slots(m) for labels in admissible)
+    end
 end
 
 @testset "bordered refuses cancelling mirrored SDP records" begin

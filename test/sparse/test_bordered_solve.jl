@@ -132,6 +132,16 @@ end
             @test SDPA._verify_bordered_direction!(ns.bordered.verifier,plan.incidence,p,pt,x,g)
             g[1] += 100
             @test !SDPA._verify_bordered_direction!(ns.bordered.verifier,plan.incidence,p,pt,x,g)
+            # The verifier's exact symmetry gate: an asymmetric iterate is
+            # declined before any interval is formed, even for an exact
+            # direction. Restoring the entry makes the same direction pass.
+            g[1] -= 100
+            X1 = pt.xMat.SDP_block[1].de_ele
+            saved = X1[1,2]
+            X1[1,2] = saved + one(T)/T(64)
+            @test !SDPA._verify_bordered_direction!(ns.bordered.verifier,plan.incidence,p,pt,x,g)
+            X1[1,2] = saved
+            @test SDPA._verify_bordered_direction!(ns.bordered.verifier,plan.incidence,p,pt,x,g)
         end
     end
 end
@@ -142,6 +152,9 @@ end
             p, expected = _bordered_solve_fixture(T)
             params = SDPA.Parameters{T}(maxIteration=100,precision=160)
             caps = SDPA._certify_bordered(p).layout.slots
+            # Every certified layout must undercut the packed full triangle;
+            # the "no slot savings" refusal guards that invariant.
+            @test caps < SDPA._schur_triangle_slots(p.m)
             logs, got = Test.collect_test_logs() do
                 SDPA.solve!(p,params; bordered_schur=true,bordered_max_slots=caps,
                             reverse_primal_dual=false, io=devnull)
@@ -160,6 +173,24 @@ end
                 @test result.final_primal_res < tol
                 @test result.final_dual_res < tol
             end
+            # Regression for the default entry point (reverse_primal_dual=true):
+            # that route solves the negated problem internally and maps the
+            # result back, so it must report the same objective values as the
+            # non-reverse solve of the same problem and as the legacy route.
+            default_logs, default = Test.collect_test_logs() do
+                SDPA.solve!(p,params; bordered_schur=true, io=devnull)
+            end
+            ref_default = SDPA.solve!(p,params; verbose=false)
+            @test "Using certified bordered Schur complement path" in
+                  string.(getfield.(default_logs,:message))
+            @test default.exit_reason === ref_default.exit_reason === SDPA.OPTIMAL_TERMINAL
+            @test default.terminal_phase === ref_default.terminal_phase === SDPA.pdOPT
+            @test default.final_obj_primal ≈ ref_default.final_obj_primal atol=tol
+            @test default.final_obj_dual ≈ ref_default.final_obj_dual atol=tol
+            @test default.final_obj_primal ≈ got.final_obj_primal atol=tol
+            @test default.final_obj_dual ≈ got.final_obj_dual atol=tol
+            @test default.final_primal_res < tol
+            @test default.final_dual_res < tol
             @test_throws "factor/panel slots" SDPA.solve!(p,params; bordered_schur=true,
                         bordered_max_slots=caps-1,reverse_primal_dual=false)
             @test_throws "mutually exclusive" SDPA.solve!(p,params; bordered_schur=true,force_sparse=true)
@@ -200,6 +231,19 @@ end
                 @test all(R.SDP_block[i].de_ele == V.SDP_block[i].de_ele == O.SDP_block[i].de_ele
                           for i in eachindex(R.SDP_block))
             end
+            # The verifier's exact symmetry gate at the public entry point: an
+            # asymmetric warm start is reported as CHOLESKY_FAILURE at the
+            # unmodified start rather than solved or silently symmetrized.
+            p,_ = _bordered_solve_fixture(T,(3,4,5,6),3)
+            initial=SDPA.SDPASolution{T}(p.m,p.blockStruct,params.lambdaStar)
+            initial.xMat.SDP_block[1].de_ele[1,2] += one(T)/T(64)
+            snapshot=copy(initial)
+            result=SDPA.solve!(p,params; bordered_schur=true,reverse_primal_dual=false,
+                               init=initial,verbose=false)
+            @test result.exit_reason === SDPA.CHOLESKY_FAILURE
+            @test result.iterations == 0
+            @test all(result.xMat.SDP_block[i].de_ele == snapshot.xMat.SDP_block[i].de_ele
+                      for i in eachindex(result.xMat.SDP_block))
         end
     end
 end
