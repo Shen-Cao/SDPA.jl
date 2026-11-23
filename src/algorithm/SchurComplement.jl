@@ -1230,6 +1230,11 @@ function make_bmat!(
     newton_state::NewtonState{T}, problem::SDPAProblem{T},
     current_pt::SDPASolution{T}, work::SDPAWorkVariables{T},
 ) where {T<:Real}
+    bordered = newton_state.bordered
+    if bordered !== nothing
+        _assemble_bordered!(bordered, newton_state, problem, current_pt, work)
+        return newton_state
+    end
     if !newton_state.use_sparse
         # Pure dense path — choose threaded vs serial by global thread count.
         if Threads.nthreads() > 1

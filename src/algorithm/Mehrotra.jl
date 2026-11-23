@@ -56,7 +56,12 @@ function mehrotra!(
     end
 
     # Step 4: solve B*dy = g. Predictor factorizes; corrector reuses.
-    ok = compute_dyvec!(newton_state, direction === :predictor)
+    predictor = direction === :predictor
+    ok = if newton_state.bordered === nothing
+        compute_dyvec!(newton_state, predictor)
+    else
+        _compute_verified_bordered_dyvec!(newton_state, predictor, problem, current_pt)
+    end
     if !ok
         return false  # Cholesky failed — caller breaks main loop
     end

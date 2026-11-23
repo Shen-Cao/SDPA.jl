@@ -455,3 +455,86 @@ diverges — the block-level profile is mandatory.
 - Julia implementation: `src/sparse/AggregateSparsity.jl`,
   `src/sparse/SparseCholesky.jl`
 - Measured campaigns: `benchmark/nsps/README.md`
+
+## Experimental bounded bordered-direct Schur solver
+
+The default routing is unchanged. To require a separately certified
+bordered backend, pass `bordered_schur=true` to `solve!`. This is a
+strict opt-in, not an automatically selected fallback. For example:
+
+```julia
+log = SDPA.solve!(problem, params; bordered_schur=true,
+                  bordered_max_slots=2_000_000)
+```
+
+Rows with exactly one nonzero SDP-block incidence seed islands; rows
+with none or more than one are potential border rows. This candidate rule
+is intentionally restricted, so it can decline a problem that could
+admit some other partition. Certification scans actual nonzero SDP
+coefficients and each LP scalar, checks the initialized tables and the
+owned row maps, and rejects a cone incidence that connects different
+interiors. There is no numerical threshold for discarding a coefficient
+and no expansion to a quadratic clique graph. Sparse coefficient blocks
+with duplicate coordinates (after normalizing mirrored positions) are
+declined rather than guessing their summed support. The experimental path
+requires 2–32 nonempty islands, at most 64 border rows and 64 original
+cone blocks, and Float64 or round-to-nearest BigFloat. It neither reads
+nor validates the old ordering environment flags (an invalid value is
+reported only when the legacy route is taken) and is incompatible with
+`force_sparse=true`.
+
+For interior sizes `n_i` and border size `k`, the factor/panel cap
+(default 16,000,000 numeric slots) counts
+`sum(n_i*(n_i+1)/2 + n_i*k) + k*(k+1)/2`. It does not count model data,
+linear scratch and incumbent solver workspaces, runtime overhead, or
+whole-process RSS. The border is allowed to be dense. A refused
+certificate or slot cap raises `ArgumentError` before any numerical
+Schur allocation. The layout builder also refuses a partition whose
+factor/panel slots would not undercut the packed full triangle
+`m*(m+1)/2` ("no slot savings"). While at least two nonempty islands are
+required that refusal cannot fire — the saving is `sum_{i<j} n_i*n_j`,
+at least 1 — and it guards a future relaxation of the island rule. The
+route streams original SDP and LP contributions
+into their packed destinations; it does not allocate a legacy skyline,
+dense Schur matrix, location table, or per-pair contribution buffer.
+
+The solver factors each interior once per predictor, overwrites its
+coupling panel with a triangular solve, and factors the reduced border.
+Independent sufficiently large interior work can run in parallel without
+nested factor tasks; border reduction order is fixed. The predictor and
+corrector reuse the factor, with no explicit matrix inverse or dense
+retry. An invalid/nonfinite reduced pivot or a pivot within a conservative
+dimension-scaled relative margin of the original diagonal is declined.
+This guard can decline a genuinely positive but numerically unresolved
+pivot and is not a proof of SPD. The Float64 route also declines
+subnormal original/reduced diagonal pivots and nonzero Gram products
+that disappear into the subnormal range.
+
+A finite candidate direction is not accepted on the strength of a
+positive factor. For **each** predictor and corrector RHS, an independent
+outward-rounded MPFR check encloses the original Schur action from the
+stored model and iterate: in each SDP cone it forms
+`U = sum(x_i * A_i)`, applies `X * U * Zinv`, and projects back onto the
+constraints; it separately contracts every LP scalar. It never reads a
+rounded factor to validate the result. The entire resulting interval
+must fit within `sqrt(eps(working type)) * norm(rhs, Inf)` of that RHS;
+an exactly zero RHS instead requires an exactly zero direction. This is
+an additional direction acceptance check, not a change to IPM
+convergence tolerances. The check needs an exactly symmetric `X` and
+`Z⁻¹` (`issymmetric`): an asymmetric warm start (`init`) or iterate is
+declined as `CHOLESKY_FAILURE` rather than symmetrized. The check works
+at `2 * working_bits + 64` bits and reuses four largest-cone matrices
+plus two row endpoint vectors and six guard scalars. That workspace is
+capped at 1,000,000 guard-precision slots, `4d^2 + 2m + 6` for the
+largest cone dimension `d` and `m` constraint rows, so the SDP cone
+dimension is at most 499 (and at that size at most 1,995 rows); a larger
+model raises `ArgumentError` before any numerical allocation. It adds
+time for the original action to both RHS solves, and can decline
+otherwise solvable but unresolved directions.
+Numerical failure returns `CHOLESKY_FAILURE` at the last accepted iterate
+without an unbounded retry. The different elimination order is not
+expected to be bit-identical to the legacy factor.
+
+`julia --project=. benchmark/nsps/audit_bordered_shape.jl` audits the
+bundled NSPS layouts without assembling or solving them. The projected
+factor/panel slots are not a measured NSPS memory footprint or speedup.

@@ -228,8 +228,8 @@ end
     solve!(problem::SDPAProblem{T}, params::Parameters{T};
            verbose::Bool=true, io::IO=stderr,
            reverse_primal_dual::Bool=true,
-           force_sparse::Bool=false,
-           init::Union{Nothing, SDPASolution{T}}=nothing,
+           force_sparse::Bool=false, bordered_schur::Bool=false,
+           bordered_max_slots::Union{Nothing,Int}=nothing, init::Union{Nothing, SDPASolution{T}}=nothing,
            time_limit_sec::Union{Nothing,Real}=nothing) -> SolutionLog{T}
 
 Solve the SDP problem using primal-dual Mehrotra predictor-corrector
@@ -268,6 +268,27 @@ negated problem terminates `pdOPT` and the display maps it back. Set
 (`min ⟨C,X⟩` semantics with direct detection of unbounded/infeasible
 status).
 
+## Experimental bordered Schur path
+`bordered_schur=true` requires a certified partition into at least two
+SDP-owned islands with a small border. It is supported for Float64 and
+nearest-rounded BigFloat. An uncertified partition, a layout without a
+slot saving against the packed full triangle, or a factor/panel slot count
+above `bordered_max_slots` raises `ArgumentError` before materializing
+any Schur matrix. The default cap is 16,000,000 slots; the cap is not a
+total-process memory limit. This strict opt-in neither reads nor validates
+the legacy ordering environment variables and is incompatible with
+`force_sparse=true` and with specifying a cap without opting in. Predictor
+and corrector directions must pass an independent outward-rounded check
+against the original Schur action. A direction is accepted only when the
+whole enclosure fits within `sqrt(eps(T)) * norm(rhs, Inf)`; that bound is
+a direction acceptance criterion, not an IPM convergence tolerance. The
+check needs an exactly symmetric `X` and `Z⁻¹`, so an asymmetric `init`
+or iterate is declined like any other numeric rejection. Its workspace is
+capped at 1,000,000 guard-precision slots (`4d^2 + 2m + 6`), i.e. an SDP
+cone dimension of at most 499. Numeric rejection returns the last accepted
+point with `CHOLESKY_FAILURE`; there is no legacy fallback. Defaults are
+unchanged.
+
 ## Precision contract
 - If `T == BigFloat`, the entire solve is wrapped in
   `setprecision(BigFloat, params.precision) do ... end`.
@@ -295,12 +316,20 @@ function solve!(
     verbose::Bool=true, io::IO=stderr,
     reverse_primal_dual::Bool=true,
     force_sparse::Bool=false,
+    bordered_schur::Bool=false,
+    bordered_max_slots::Union{Nothing,Int}=nothing,
     init::Union{Nothing, SDPASolution{T}}=nothing,
     time_limit_sec::Union{Nothing,Real}=nothing,
     # Internal testing hook: throws after the BLAS policy is set. Not
     # part of the public API.
     _test_throw_after_blas::Bool=false,
 ) where {T<:Real}
+    if bordered_schur
+        force_sparse && _bordered_refuse("bordered_schur and force_sparse are mutually exclusive")
+    elseif bordered_max_slots !== nothing
+        _bordered_refuse("bordered_max_slots requires bordered_schur=true")
+    end
+    slot_limit = bordered_schur ? something(bordered_max_slots, _BORDERED_DEFAULT_MAX_SLOTS) : nothing
     # Negation, independent value copies and display arithmetic all allocate
     # their BigFloat destinations at the current precision. Keep the entire
     # raw solve, not just Newton iterations, in the requested scope.
@@ -309,7 +338,7 @@ function solve!(
         # otherwise a manually built problem may need its derived indices.
         p = reverse_primal_dual ? _problem_with_negated_C(problem) : _ensure_index_tables!(problem)
         log = _solve_inner!(p, params, verbose, io, force_sparse, init;
-                            time_limit_sec=time_limit_sec,
+                            time_limit_sec=time_limit_sec, bordered_slot_limit=slot_limit,
                             _test_throw_after_blas=_test_throw_after_blas)
         return reverse_primal_dual ? _reverse_display(log) : log
     end
@@ -378,13 +407,14 @@ function _solve_inner!(
     verbose::Bool, io::IO, force_sparse::Bool=false,
     init::Union{Nothing, SDPASolution{T}}=nothing;
     time_limit_sec::Union{Nothing,Real}=nothing,
+    bordered_slot_limit::Union{Nothing,Int}=nothing,
     _test_throw_after_blas::Bool=false,
 ) where {T<:Real}
     lock(_BLAS_POLICY_LOCK)
     try
         return _solve_inner_locked!(
             problem, params, verbose, io, force_sparse, init;
-            time_limit_sec=time_limit_sec,
+            time_limit_sec=time_limit_sec, bordered_slot_limit=bordered_slot_limit,
             _test_throw_after_blas=_test_throw_after_blas,
         )
     finally
@@ -422,9 +452,13 @@ function _solve_inner_locked!(
     verbose::Bool, io::IO, force_sparse::Bool=false,
     init::Union{Nothing, SDPASolution{T}}=nothing;
     time_limit_sec::Union{Nothing,Real}=nothing,
+    bordered_slot_limit::Union{Nothing,Int}=nothing,
     _test_throw_after_blas::Bool=false,
 ) where {T<:Real}
-    _validate_sdpa_env_vars()
+    # The bordered opt-in never reads the legacy ordering environment
+    # variables, so it does not validate them either: an invalid value is
+    # reported only when the legacy route is taken.
+    bordered_slot_limit === nothing && _validate_sdpa_env_vars()
     # ---------------------------------------------------------------
     # 1. Allocate state (mirror C++ pinpal at sdpa_main.cpp:228-282).
     # ---------------------------------------------------------------
@@ -445,6 +479,26 @@ function _solve_inner_locked!(
             error("test injection: throw after BLAS policy set")
         end
         t_start = time_ns()
+        bordered_plan = if bordered_slot_limit === nothing
+            nothing
+        else
+            T in (Float64, BigFloat) || _bordered_refuse("requires Float64 or BigFloat")
+            T === BigFloat && rounding(BigFloat) !== RoundNearest &&
+                _bordered_refuse("requires nearest rounding for BigFloat")
+            problem.nBlock <= _BORDERED_MAX_MODEL_BLOCKS ||
+                _bordered_refuse("model has more than $_BORDERED_MAX_MODEL_BLOCKS cone blocks")
+            _bordered_verify_slots(problem.m, _bordered_verify_dim(problem.blockStruct))
+            all(isfinite, problem.b.ele) || _bordered_refuse("non-finite RHS coefficient")
+            for j in eachindex(problem.C.SDP_sp_block)
+                isassigned(problem.C.SDP_sp_block, j) || continue
+                D = problem.C.SDP_sp_block[j]
+                values = D.type === :dense ? D.de_ele : view(D.sp_ele, 1:D.nonZeroEffect)
+                all(isfinite, values) || _bordered_refuse("non-finite SDP objective coefficient")
+            end
+            all(isfinite, problem.C.LP_sp_val) ||
+                _bordered_refuse("non-finite LP objective coefficient")
+            _certify_bordered(problem; max_slots=bordered_slot_limit)
+        end
         # The solve mutates current_pt in place (IterateUpdate.update!
         # writes X/y/Z directly), so warm-start from a VALUE COPY — the
         # caller's init object must come back untouched, matching the
@@ -605,154 +659,163 @@ function _solve_inner_locked!(
         # Compute formula selection once (F1/F2/F3 per constraint).
         compute_formula!(newton, problem)
 
-        # Analyze sparsity to decide dense vs sparse Schur complement.
-        # force_sparse is threaded through so analyze_sparsity's early
-        # gate (skip the position-level graph when m/nBlock already route
-        # dense) does not fire when the override below needs the graph.
-        use_dense, ordering, adj = analyze_sparsity(problem; force_sparse=force_sparse)
-        # EXPERIMENTAL (bench-only, mirrors C++ Spooles ND/MS on the BLOCK-level
-        # graph, sdpa_chordal.cpp:141-211): SDPA_BLOCK_ORDERING=1 replaces the
-        # position-level aggregate graph with the BLOCK-level graph for ordering.
-        # C++ keeps the 4 dense SDP cliques contiguous → ~13M profile;
-        # the position-level graph interleaves them → 52M profile (16× more
-        # Cholesky work). This env var restores the C++-comparable profile.
-        #
-        # SDPA_ORDERING generalizes the same switch (precedence: SDPA_ORDERING
-        # wins if both are set; SDPA_BLOCK_ORDERING=1 behaves as
-        # SDPA_ORDERING=block; SDPA_BLOCK_ORDERING=1 + SDPA_ORDERING=auto → auto):
-        #   - "block"  → force the block-level ordering (identical to
-        #                SDPA_BLOCK_ORDERING=1);
-        #   - "auto"   → route by the POSITION-level closed-profile density
-        #                (the fill-in-closed envelope computed with the position
-        #                ordering, hoisted before the ordering decision — the
-        #                legacy code computes the envelope only after the branch,
-        #                for the chosen ordering): block iff density > 0.4.
-        #                0.4 is a heuristic threshold (C++ `extend_threshold`
-        #                precedent); the mid-density crossover is unvalidated.
-        #                The block graph + METIS ordering are built LAZILY,
-        #                only when routed to block — the block-graph build
-        #                cost is never paid on sparse problems.
-        #   - absent   → current behavior exactly (literal pass-through of the
-        #                legacy branch structure below).
-        # The force_sparse override (position-METIS when force_sparse &&
-        # use_dense) below applies with the same precedence to both env names.
-        sdp_ordering = get(ENV, "SDPA_ORDERING", "")
-        sdp_block_ordering = get(ENV, "SDPA_BLOCK_ORDERING", "")
-        if !isempty(sdp_ordering)
-            if sdp_ordering == "block"
-                if !use_dense
-                    ordering = _block_level_ordering(problem)
-                    if verbose
-                        @info "ordering routing: block (SDPA_ORDERING=block)"
-                    end
-                end
-            elseif sdp_ordering == "auto"
-                if !use_dense
-                    reverse_ordering = Vector{Int}(undef, problem.m)
-                    for (pos, orig) in enumerate(ordering)
-                        reverse_ordering[orig] = pos
-                    end
-                    pos_skyline = SDPA.build_skyline_from_problem!(
-                        problem, ordering, reverse_ordering)
-                    full_nnz = _schur_triangle_slots(problem.m)
-                    pos_slots = _schur_route_slots(pos_skyline)
-                    pos_density = pos_slots / full_nnz
-                    if _schur_density_exceeds(pos_slots, full_nnz, 2, 5)
+        if bordered_plan === nothing
+            # Analyze sparsity to decide dense vs sparse Schur complement.
+            # force_sparse is threaded through so analyze_sparsity's early
+            # gate (skip the position-level graph when m/nBlock already route
+            # dense) does not fire when the override below needs the graph.
+            use_dense, ordering, adj = analyze_sparsity(problem; force_sparse=force_sparse)
+            # EXPERIMENTAL (bench-only, mirrors C++ Spooles ND/MS on the BLOCK-level
+            # graph, sdpa_chordal.cpp:141-211): SDPA_BLOCK_ORDERING=1 replaces the
+            # position-level aggregate graph with the BLOCK-level graph for ordering.
+            # C++ keeps the 4 dense SDP cliques contiguous → ~13M profile;
+            # the position-level graph interleaves them → 52M profile (16× more
+            # Cholesky work). This env var restores the C++-comparable profile.
+            #
+            # SDPA_ORDERING generalizes the same switch (precedence: SDPA_ORDERING
+            # wins if both are set; SDPA_BLOCK_ORDERING=1 behaves as
+            # SDPA_ORDERING=block; SDPA_BLOCK_ORDERING=1 + SDPA_ORDERING=auto → auto):
+            #   - "block"  → force the block-level ordering (identical to
+            #                SDPA_BLOCK_ORDERING=1);
+            #   - "auto"   → route by the POSITION-level closed-profile density
+            #                (the fill-in-closed envelope computed with the position
+            #                ordering, hoisted before the ordering decision — the
+            #                legacy code computes the envelope only after the branch,
+            #                for the chosen ordering): block iff density > 0.4.
+            #                0.4 is a heuristic threshold (C++ `extend_threshold`
+            #                precedent); the mid-density crossover is unvalidated.
+            #                The block graph + METIS ordering are built LAZILY,
+            #                only when routed to block — the block-graph build
+            #                cost is never paid on sparse problems.
+            #   - absent   → current behavior exactly (literal pass-through of the
+            #                legacy branch structure below).
+            # The force_sparse override (position-METIS when force_sparse &&
+            # use_dense) below applies with the same precedence to both env names.
+            sdp_ordering = get(ENV, "SDPA_ORDERING", "")
+            sdp_block_ordering = get(ENV, "SDPA_BLOCK_ORDERING", "")
+            if !isempty(sdp_ordering)
+                if sdp_ordering == "block"
+                    if !use_dense
                         ordering = _block_level_ordering(problem)
                         if verbose
-                            @info "ordering routing: block (position-level " *
+                            @info "ordering routing: block (SDPA_ORDERING=block)"
+                        end
+                    end
+                elseif sdp_ordering == "auto"
+                    if !use_dense
+                        reverse_ordering = Vector{Int}(undef, problem.m)
+                        for (pos, orig) in enumerate(ordering)
+                            reverse_ordering[orig] = pos
+                        end
+                        pos_skyline = SDPA.build_skyline_from_problem!(
+                            problem, ordering, reverse_ordering)
+                        full_nnz = _schur_triangle_slots(problem.m)
+                        pos_slots = _schur_route_slots(pos_skyline)
+                        pos_density = pos_slots / full_nnz
+                        if _schur_density_exceeds(pos_slots, full_nnz, 2, 5)
+                            ordering = _block_level_ordering(problem)
+                            if verbose
+                                @info "ordering routing: block (position-level " *
+                                      "density=$(round(pos_density*100; digits=2))%)"
+                            end
+                        elseif verbose
+                            @info "ordering routing: position-metis (position-level " *
                                   "density=$(round(pos_density*100; digits=2))%)"
                         end
-                    elseif verbose
-                        @info "ordering routing: position-metis (position-level " *
-                              "density=$(round(pos_density*100; digits=2))%)"
                     end
                 end
+            elseif sdp_block_ordering == "1" && !use_dense
+                ordering = _block_level_ordering(problem)
             end
-        elseif sdp_block_ordering == "1" && !use_dense
-            ordering = _block_level_ordering(problem)
-        end
-        if force_sparse && use_dense
-            problem.m > 0 || error(
-                "force_sparse requires at least one constraint (m >= 1); " *
-                "with m = 0 there is no Schur complement to factor",
-            )
-            # Override to sparse path with Metis nested-dissection ordering
-            # (matches C++ SDPA-GMP's Spooles ND/MS, more numerically robust
-            # than AMD for position-level sparse approximation).
-            ordering = SDPA.compute_ordering(adj; method=:metis)
-            use_dense = false
-        end
-        if !use_dense
-            newton.use_sparse = true
-            newton.ordering = ordering
-            # Build reverse ordering for fast lookup.
-            newton.reverse_ordering = Vector{Int}(undef, problem.m)
-            for (pos, orig) in enumerate(ordering)
-                newton.reverse_ordering[orig] = pos
+            if force_sparse && use_dense
+                problem.m > 0 || error(
+                    "force_sparse requires at least one constraint (m >= 1); " *
+                    "with m = 0 there is no Schur complement to factor",
+                )
+                # Override to sparse path with Metis nested-dissection ordering
+                # (matches C++ SDPA-GMP's Spooles ND/MS, more numerically robust
+                # than AMD for position-level sparse approximation).
+                ordering = SDPA.compute_ordering(adj; method=:metis)
+                use_dense = false
             end
-            if verbose
-                @info "Using sparse Schur complement path (m=$(problem.m))"
-            end
-            # Use BLOCK-LEVEL skyline for the density decision (matching C++).
-            # C++ Chordal::ordering_bMat checks nBlock <= 5 and
-            # SDP_nConstraint[b] > m * sqrt(0.25). If either triggers, dense path.
-            # Block-level is broader than position-level because F1/F2/F3 couple
-            # all positions within a block via X, Z⁻¹.
-            block_skyline = SDPA.build_skyline_from_problem!(
-                problem, ordering, newton.reverse_ordering)
-            full_nnz = _schur_triangle_slots(problem.m)
-            block_profile_nnz = _schur_route_slots(block_skyline)
-            block_density = block_profile_nnz / full_nnz
-            if verbose
-                @info "Block-level skyline: $block_profile_nnz entries " *
-                      "(density=$(round(block_density*100; digits=2))%)"
-            end
-            if _schur_density_exceeds(block_profile_nnz, full_nnz, 1, 4)
-                if verbose
-                    @info "Block-level density >25% — using dense path " *
-                          "(F1/F2/F3 couple all constraints within blocks)"
+            if !use_dense
+                newton.use_sparse = true
+                newton.ordering = ordering
+                # Build reverse ordering for fast lookup.
+                newton.reverse_ordering = Vector{Int}(undef, problem.m)
+                for (pos, orig) in enumerate(ordering)
+                    newton.reverse_ordering[orig] = pos
                 end
-                # EXPERIMENTAL (bench-only, mirrors C++ `#if 1 // SPARSE
-                # computation for debugging` in sdpa_chordal.cpp:53-57):
-                # SDPA_FORCE_SPARSE_PROFILE=1 forces the sparse path even at
-                # 100% density, to benchmark the profile-form Cholesky
-                # against the C++ forced-sparse build. Not a documented user
-                # feature; dense remains the default.
-                if get(ENV, "SDPA_FORCE_SPARSE_PROFILE", "") == "1"
-                    newton.sparse_bmat = _SchurSkyline{T}(block_skyline)
-                    make_aggrigate_index_sdp!(newton, problem, ordering)
-                    if verbose
-                        @info "FORCED sparse profile (SDPA_FORCE_SPARSE_PROFILE=1): " *
-                              "$block_profile_nnz entries (density=100%)"
-                    end
-                else
-                    ensure_dense_bmat!(newton)   # dense decision: materialize the bmat
-                    newton.use_sparse = false
-                end
-            else
-                # Block-level density is low enough for sparse.
-                # Build the profile from the BLOCK-LEVEL skyline — the same
-                # `block_skyline` used for the density gate above (F1). This
-                # covers every block-level (i,j) pair that
-                # make_aggrigate_index_sdp! emits (C++ Chordal::makeGraph
-                # connectivity, sdpa_chordal.cpp:141-211), so the pair-range
-                # `error` inside it (`_schur_assembly_slot`) can never fire. A
-                # position-level skyline would
-                # truncate the Schur matrix (it misses block-level pairs).
                 if verbose
-                    @info "Block-level profile: $block_profile_nnz entries " *
+                    @info "Using sparse Schur complement path (m=$(problem.m))"
+                end
+                # Use BLOCK-LEVEL skyline for the density decision (matching C++).
+                # C++ Chordal::ordering_bMat checks nBlock <= 5 and
+                # SDP_nConstraint[b] > m * sqrt(0.25). If either triggers, dense path.
+                # Block-level is broader than position-level because F1/F2/F3 couple
+                # all positions within a block via X, Z⁻¹.
+                block_skyline = SDPA.build_skyline_from_problem!(
+                    problem, ordering, newton.reverse_ordering)
+                full_nnz = _schur_triangle_slots(problem.m)
+                block_profile_nnz = _schur_route_slots(block_skyline)
+                block_density = block_profile_nnz / full_nnz
+                if verbose
+                    @info "Block-level skyline: $block_profile_nnz entries " *
                           "(density=$(round(block_density*100; digits=2))%)"
                 end
-                # Allocate sparse profile + location table.
-                newton.sparse_bmat = _SchurSkyline{T}(block_skyline)
-                make_aggrigate_index_sdp!(newton, problem, ordering)
+                if _schur_density_exceeds(block_profile_nnz, full_nnz, 1, 4)
+                    if verbose
+                        @info "Block-level density >25% — using dense path " *
+                              "(F1/F2/F3 couple all constraints within blocks)"
+                    end
+                    # EXPERIMENTAL (bench-only, mirrors C++ `#if 1 // SPARSE
+                    # computation for debugging` in sdpa_chordal.cpp:53-57):
+                    # SDPA_FORCE_SPARSE_PROFILE=1 forces the sparse path even at
+                    # 100% density, to benchmark the profile-form Cholesky
+                    # against the C++ forced-sparse build. Not a documented user
+                    # feature; dense remains the default.
+                    if get(ENV, "SDPA_FORCE_SPARSE_PROFILE", "") == "1"
+                        newton.sparse_bmat = _SchurSkyline{T}(block_skyline)
+                        make_aggrigate_index_sdp!(newton, problem, ordering)
+                        if verbose
+                            @info "FORCED sparse profile (SDPA_FORCE_SPARSE_PROFILE=1): " *
+                                  "$block_profile_nnz entries (density=100%)"
+                        end
+                    else
+                        ensure_dense_bmat!(newton)   # dense decision: materialize the bmat
+                        newton.use_sparse = false
+                    end
+                else
+                    # Block-level density is low enough for sparse.
+                    # Build the profile from the BLOCK-LEVEL skyline — the same
+                    # `block_skyline` used for the density gate above (F1). This
+                    # covers every block-level (i,j) pair that
+                    # make_aggrigate_index_sdp! emits (C++ Chordal::makeGraph
+                    # connectivity, sdpa_chordal.cpp:141-211), so the pair-range
+                    # `error` inside it (`_schur_assembly_slot`) can never fire. A
+                    # position-level skyline would
+                    # truncate the Schur matrix (it misses block-level pairs).
+                    if verbose
+                        @info "Block-level profile: $block_profile_nnz entries " *
+                              "(density=$(round(block_density*100; digits=2))%)"
+                    end
+                    # Allocate sparse profile + location table.
+                    newton.sparse_bmat = _SchurSkyline{T}(block_skyline)
+                    make_aggrigate_index_sdp!(newton, problem, ordering)
+                end
+            else
+                ensure_dense_bmat!(newton)   # dense decision: materialize the bmat
+                newton.use_sparse = false
+                if verbose
+                    @info "Using dense Schur complement path"
+                end
             end
         else
-            ensure_dense_bmat!(newton)   # dense decision: materialize the bmat
-            newton.use_sparse = false
+            layout = bordered_plan.layout
+            newton.bordered = _BorderedSchur(
+                _BorderedFactors{T}(layout), bordered_plan.incidence, problem.blockStruct)
             if verbose
-                @info "Using dense Schur complement path"
+                @info "Using certified bordered Schur complement path" islands=layout.sizes border=layout.border slots=layout.slots
             end
         end
 

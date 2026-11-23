@@ -52,6 +52,7 @@ mutable struct NewtonState{T<:Real}
     x_rd_zinvMat::SDPADenseLinearSpace{T}
     useFormula::Matrix{Symbol}
     cholesky_factorization::Union{Cholesky{T,Matrix{T}},Nothing}
+    bordered::Union{Nothing,_BorderedSchur{T}}
     # Sparse Schur complement fields
     sparse_bmat::Union{Nothing,SDPASparseMatrix{T},_SchurSkyline{T}}
     # Only used by explicit-coordinate callers. Production _SchurSkyline
@@ -129,6 +130,7 @@ function NewtonState{T}(
         SDPADenseLinearSpace{T}(blockStruct),                  # x_rd_zinvMat
         fill(:F1, m, length(blockStruct)),                   # useFormula default (per (i, l))
         nothing,                                                # cholesky_factorization
+        nothing,                                                # bordered
         nothing,                                                # sparse_bmat
         Int[],                                                  # diagonalIndex
         Int[],                                                  # ordering

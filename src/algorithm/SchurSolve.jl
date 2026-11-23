@@ -27,6 +27,10 @@ definite (triggers main-loop break in the caller).
 Mirrors C++ `Lal::choleskyFactorWithAdjust` at `sdpa_linear.cpp:608-681`.
 """
 function cholesky_schur!(newton_state::NewtonState{T}) where {T<:Real}
+    bordered = newton_state.bordered
+    if bordered !== nothing
+        return _factor_bordered!(bordered.factors)
+    end
     if newton_state.use_sparse
         sparse_bmat = newton_state.sparse_bmat
         sparse_bmat === nothing && error("cholesky_schur!: sparse_bmat is nothing but use_sparse=true")
@@ -82,6 +86,7 @@ Mirrors C++ `Newton::compute_DyVec` at `sdpa_newton.cpp:1308-1344`.
 function compute_dyvec!(
     newton_state::NewtonState{T}, is_predictor::Bool
 ) where {T<:Real}
+    newton_state.bordered === nothing || error("bordered direction requires original-action verification")
     if is_predictor
         ok = cholesky_schur!(newton_state)
         if !ok
@@ -133,6 +138,23 @@ function compute_dyvec!(
         copyto!(newton_state.DyVec.ele, newton_state.gvec.ele)
         ldiv!(F, newton_state.DyVec.ele)
     end
+    return true
+end
+
+function _compute_verified_bordered_dyvec!(
+    newton::NewtonState, is_predictor::Bool, problem::SDPAProblem, pt::SDPASolution,
+)
+    schur = newton.bordered
+    schur === nothing && error("bordered Schur path is not initialized")
+    F = schur.factors
+    is_predictor && !_factor_bordered!(F) && return false
+    g, x = newton.gvec.ele, schur.candidate
+    if !_solve_bordered!(x, F, g) ||
+       !_verify_bordered_direction!(schur.verifier, schur.incidence, problem, pt, x, g)
+        F.state = _BORDERED_FAILED
+        return false
+    end
+    _copyto_independent!(newton.DyVec.ele, x)
     return true
 end
 
